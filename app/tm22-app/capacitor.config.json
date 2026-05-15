@@ -1,0 +1,22 @@
+{
+  "appId": "com.tm22.ballistics",
+  "appName": "MatchOS",
+  "webDir": "www",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "backgroundColor": "#0f172a",
+    "allowMixedContent": false
+  },
+  "plugins": {
+    "BluetoothLe": {
+      "displayStrings": {
+        "scanning": "Scanning for devices...",
+        "cancel": "Cancel",
+        "availableDevices": "Available Devices",
+        "noDeviceFound": "No device found"
+      }
+    }
+  }
+}

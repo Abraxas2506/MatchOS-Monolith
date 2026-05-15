@@ -1,0 +1,2473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="theme-color" content="#0f172a">
+  <title>MatchOS</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    body { background: #0f172a; overflow-x: hidden; -webkit-font-smoothing: antialiased;
+      padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom);
+      padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right); }
+    input, select, button { font-family: inherit; }
+    input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; }
+    select { -webkit-appearance: none; appearance: none; }
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 2px; }
+    details summary { list-style: none; }
+    details summary::-webkit-details-marker { display: none; }
+  </style>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+const { useState, useEffect, useCallback, useMemo, useRef } = React;
+
+// ============================================================================
+// BLE SERVICE — DOPE Card, Calypso, Kestrel, Sig Kilo
+// ============================================================================
+const BLE = {
+  available: false,
+  plugin: null,
+  connected: {},  // deviceId -> { type, name }
+
+  // Device UUIDs
+  DOPE_CARD: {
+    service: "4fafc201-1fb5-459e-8fcc-c5c9c331914b",
+    dopeWrite: "beb5483e-36e1-4688-b7f5-ea07361b26a8",
+    weatherRead: "beb5483f-36e1-4688-b7f5-ea07361b26a8",
+    imuRead: "beb54840-36e1-4688-b7f5-ea07361b26a8",
+    shotNotify: "beb54841-36e1-4688-b7f5-ea07361b26a8",
+    nameFilter: "TM22"
+  },
+  CALYPSO: {
+    service: "0000181a-0000-1000-8000-00805f9b34fb",
+    temp: "00002a6e-0000-1000-8000-00805f9b34fb",
+    pressure: "00002a6d-0000-1000-8000-00805f9b34fb",
+    humidity: "00002a6f-0000-1000-8000-00805f9b34fb",
+    windSpeed: "00002a72-0000-1000-8000-00805f9b34fb",
+    windDir: "00002a73-0000-1000-8000-00805f9b34fb",
+    nameFilter: "CALYPSO"
+  },
+  KESTREL: {
+    service: "ffffffff-c446-4c4f-8c64-000000000000",
+    nameFilter: "Kestrel"
+    // Characteristic UUIDs TBD — nRF Connect mapping session required
+  },
+  SIG_KILO: {
+    service: "0000fff0-0000-1000-8000-00805f9b34fb",
+    txChar: "0000fff1-0000-1000-8000-00805f9b34fb",
+    rxChar: "0000fff2-0000-1000-8000-00805f9b34fb",
+    nameFilter: "KILO"
+  },
+
+  async init() {
+    try {
+      if (window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform()) {
+        const plugins = window.Capacitor.Plugins;
+        if (plugins && plugins.BluetoothLe) {
+          this.plugin = plugins.BluetoothLe;
+          await this.plugin.initialize();
+          this.available = true;
+          console.log("BLE: Capacitor plugin ready");
+          return true;
+        }
+      }
+      console.log("BLE: Not available (browser or plugin missing)");
+      return false;
+    } catch (e) {
+      console.warn("BLE init failed:", e);
+      return false;
+    }
+  },
+
+  async scan(nameFilter, timeout = 5000) {
+    if (!this.available) return [];
+    const devices = [];
+    try {
+      await this.plugin.requestLEScan({ services: [], namePrefix: nameFilter }, (result) => {
+        if (result.device && !devices.find(d => d.deviceId === result.device.deviceId)) {
+          devices.push({ deviceId: result.device.deviceId, name: result.device.name || "Unknown" });
+        }
+      });
+      await new Promise(r => setTimeout(r, timeout));
+      await this.plugin.stopLEScan();
+    } catch (e) { console.warn("Scan error:", e); }
+    return devices;
+  },
+
+  async connect(deviceId, type) {
+    if (!this.available) return false;
+    try {
+      await this.plugin.connect(deviceId, (disconnectId) => {
+        delete this.connected[disconnectId];
+        console.log("BLE: Disconnected", disconnectId);
+      });
+      this.connected[deviceId] = { type };
+      console.log("BLE: Connected", deviceId, type);
+      return true;
+    } catch (e) { console.warn("Connect error:", e); return false; }
+  },
+
+  async disconnect(deviceId) {
+    if (!this.available) return;
+    try { await this.plugin.disconnect(deviceId); } catch (e) {}
+    delete this.connected[deviceId];
+  },
+
+  async read(deviceId, serviceUUID, charUUID) {
+    if (!this.available) return null;
+    try {
+      const result = await this.plugin.read(deviceId, serviceUUID, charUUID);
+      return result?.value ? new DataView(this._b64ToBuffer(result.value)) : null;
+    } catch (e) { console.warn("Read error:", e); return null; }
+  },
+
+  async write(deviceId, serviceUUID, charUUID, data) {
+    if (!this.available) return false;
+    try {
+      const b64 = this._bufferToB64(data);
+      await this.plugin.write(deviceId, serviceUUID, charUUID, b64);
+      return true;
+    } catch (e) { console.warn("Write error:", e); return false; }
+  },
+
+  async startNotify(deviceId, serviceUUID, charUUID, callback) {
+    if (!this.available) return false;
+    try {
+      await this.plugin.startNotifications(deviceId, serviceUUID, charUUID, (result) => {
+        if (result?.value) callback(new DataView(this._b64ToBuffer(result.value)));
+      });
+      return true;
+    } catch (e) { console.warn("Notify error:", e); return false; }
+  },
+
+  // === DOPE CARD: Build and send packet ===
+  buildDopePacket(stageData) {
+    // Binary format matching ESP32 firmware:
+    // [stageName 16B][totalRounds 1B][numEngagements 1B][windMph 1B][tempF 1B]
+    // Per engagement: [label 8B][posLabel 8B][distYd 2B][shots 1B][elevCentimil 2B signed]
+    //                 [windCentimil 2B signed][confidence 1B][windDir 1B][targetSizeIn 1B]
+    const buf = new ArrayBuffer(20 + stageData.engagements.length * 25);
+    const dv = new DataView(buf);
+    let offset = 0;
+    // Stage name (16 bytes, padded)
+    const nameBytes = new TextEncoder().encode((stageData.name || "").slice(0, 16).padEnd(16, "\0"));
+    nameBytes.forEach((b, i) => dv.setUint8(offset + i, b));
+    offset += 16;
+    dv.setUint8(offset++, stageData.totalRounds || 0);
+    dv.setUint8(offset++, stageData.engagements.length);
+    dv.setUint8(offset++, Math.round(stageData.windMph || 0));
+    dv.setUint8(offset++, Math.round(stageData.tempF || 70));
+    // Engagements
+    for (const eng of stageData.engagements) {
+      const label = new TextEncoder().encode((eng.label || "").slice(0, 8).padEnd(8, "\0"));
+      label.forEach((b, i) => dv.setUint8(offset + i, b));
+      offset += 8;
+      const posLabel = new TextEncoder().encode((eng.position || "").slice(0, 8).padEnd(8, "\0"));
+      posLabel.forEach((b, i) => dv.setUint8(offset + i, b));
+      offset += 8;
+      dv.setUint16(offset, eng.distYd || 0, true); offset += 2;
+      dv.setUint8(offset++, eng.shots || 1);
+      dv.setInt16(offset, Math.round((eng.elevMil || 0) * 100), true); offset += 2;
+      dv.setInt16(offset, Math.round((eng.windMil || 0) * 100), true); offset += 2;
+      dv.setUint8(offset++, eng.confidence || 0);
+      dv.setUint8(offset++, eng.windDir || 0);  // 0=none 1=left 2=right
+      dv.setUint8(offset++, eng.targetSizeIn || 6);
+    }
+    return new Uint8Array(buf, 0, offset);
+  },
+
+  async sendDope(deviceId, stageData) {
+    const packet = this.buildDopePacket(stageData);
+    return await this.write(deviceId, this.DOPE_CARD.service, this.DOPE_CARD.dopeWrite, packet);
+  },
+
+  // === CALYPSO: Parse standard BLE environmental data ===
+  parseCalypsoTemp(dv) { return dv.getInt16(0, true) / 100; },  // °C
+  parseCalypsoPressure(dv) { return dv.getUint32(0, true) / 10; },  // Pa → /10 = dPa
+  parseCalypsoHumidity(dv) { return dv.getUint16(0, true) / 100; },  // %
+  parseCalypsoWindSpeed(dv) { return dv.getUint16(0, true) / 100; },  // m/s
+  parseCalypsoWindDir(dv) { return dv.getUint16(0, true) / 100; },  // degrees
+
+  // === Helpers ===
+  _b64ToBuffer(b64) {
+    const bin = atob(b64);
+    const buf = new ArrayBuffer(bin.length);
+    const u8 = new Uint8Array(buf);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    return buf;
+  },
+  _bufferToB64(u8arr) {
+    let bin = "";
+    u8arr.forEach(b => bin += String.fromCharCode(b));
+    return btoa(bin);
+  }
+};
+
+// Initialize BLE on load
+BLE.init();
+
+// ============================================================================
+// BLE CONNECTION PANEL (reusable component)
+// ============================================================================
+function BlePanel({ onWeatherUpdate, onRangeUpdate }) {
+  const [bleReady, setBleReady] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [devices, setDevices] = useState({
+    dopeCard: null, calypso: null, kestrel: null, sigKilo: null
+  });
+  const [weather, setWeather] = useState({ temp: null, pressure: null, humidity: null, windSpeed: null, windDir: null, source: null });
+  const [lastRange, setLastRange] = useState(null);
+  const [status, setStatus] = useState("");
+
+  useEffect(() => {
+    const check = async () => { setBleReady(BLE.available || await BLE.init()); };
+    check();
+  }, []);
+
+  const scanAndConnect = async (type) => {
+    if (!bleReady) { setStatus("BLE not available"); return; }
+    setScanning(true);
+    setStatus("Scanning...");
+    const config = BLE[type === "dopeCard" ? "DOPE_CARD" : type === "calypso" ? "CALYPSO" : type === "kestrel" ? "KESTREL" : "SIG_KILO"];
+    const found = await BLE.scan(config.nameFilter, 5000);
+    if (found.length === 0) { setStatus("No devices found"); setScanning(false); return; }
+    // Auto-connect to first match
+    const dev = found[0];
+    setStatus("Connecting to " + dev.name + "...");
+    const ok = await BLE.connect(dev.deviceId, type);
+    if (ok) {
+      setDevices(prev => ({ ...prev, [type]: { id: dev.deviceId, name: dev.name } }));
+      setStatus("Connected: " + dev.name);
+      // Start notifications based on type
+      if (type === "calypso") { startCalypsoNotify(dev.deviceId); }
+      if (type === "sigKilo") { startKiloNotify(dev.deviceId); }
+    } else {
+      setStatus("Connection failed");
+    }
+    setScanning(false);
+  };
+
+  const disconnectDevice = async (type) => {
+    const dev = devices[type];
+    if (dev) {
+      await BLE.disconnect(dev.id);
+      setDevices(prev => ({ ...prev, [type]: null }));
+      setStatus("Disconnected");
+    }
+  };
+
+  const startCalypsoNotify = async (deviceId) => {
+    const svc = BLE.CALYPSO.service;
+    await BLE.startNotify(deviceId, svc, BLE.CALYPSO.temp, (dv) => {
+      const tempC = BLE.parseCalypsoTemp(dv);
+      const tempF = tempC * 9/5 + 32;
+      setWeather(prev => { const n = {...prev, temp: tempF, source: "Calypso"}; onWeatherUpdate?.(n); return n; });
+    });
+    await BLE.startNotify(deviceId, svc, BLE.CALYPSO.pressure, (dv) => {
+      const pa = BLE.parseCalypsoPressure(dv);
+      const inHg = pa / 3386.39;
+      setWeather(prev => { const n = {...prev, pressure: inHg, source: "Calypso"}; onWeatherUpdate?.(n); return n; });
+    });
+    await BLE.startNotify(deviceId, svc, BLE.CALYPSO.humidity, (dv) => {
+      const h = BLE.parseCalypsoHumidity(dv);
+      setWeather(prev => { const n = {...prev, humidity: h, source: "Calypso"}; onWeatherUpdate?.(n); return n; });
+    });
+    await BLE.startNotify(deviceId, svc, BLE.CALYPSO.windSpeed, (dv) => {
+      const ms = BLE.parseCalypsoWindSpeed(dv);
+      const mph = ms * 2.237;
+      setWeather(prev => { const n = {...prev, windSpeed: mph, source: "Calypso"}; onWeatherUpdate?.(n); return n; });
+    });
+    await BLE.startNotify(deviceId, svc, BLE.CALYPSO.windDir, (dv) => {
+      const deg = BLE.parseCalypsoWindDir(dv);
+      setWeather(prev => { const n = {...prev, windDir: deg, source: "Calypso"}; onWeatherUpdate?.(n); return n; });
+    });
+  };
+
+  const startKiloNotify = async (deviceId) => {
+    // Subscribe to range messages from Sig Kilo
+    await BLE.startNotify(deviceId, BLE.SIG_KILO.service, BLE.SIG_KILO.rxChar, (dv) => {
+      // TODO: Parse RangeMessage byte format after nRF Connect recon
+      // For now, log raw data
+      console.log("Kilo RX:", new Uint8Array(dv.buffer));
+    });
+  };
+
+  const DevBtn = ({ type, label, icon }) => {
+    const dev = devices[type];
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 0", borderBottom: `1px solid ${C.border}` }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 16 }}>{icon}</span>
+          <div>
+            <div style={{ color: C.text, fontSize: 13, fontWeight: 600 }}>{label}</div>
+            {dev && <div style={{ color: C.green, fontSize: 11 }}>{dev.name}</div>}
+          </div>
+        </div>
+        {dev ? (
+          <button onClick={() => disconnectDevice(type)} style={{ ...sBtnSm, background: C.red, fontSize: 11, padding: "4px 10px" }}>Disconnect</button>
+        ) : (
+          <button onClick={() => scanAndConnect(type)} disabled={scanning} style={{ ...sBtnSm, fontSize: 11, padding: "4px 10px", opacity: scanning ? 0.5 : 1 }}>
+            {scanning ? "..." : "Connect"}
+          </button>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div>
+      {!bleReady && (
+        <div style={{ ...sCard, textAlign: "center", color: C.yellow, fontSize: 13 }}>
+          BLE not available — run on Android via Capacitor to enable device connections
+        </div>
+      )}
+      <div style={sCard}>
+        <div style={{ color: C.accent, fontSize: 15, fontWeight: 700, marginBottom: 8 }}>Devices</div>
+        <DevBtn type="dopeCard" label="TM22 DOPE Card" icon="📡" />
+        <DevBtn type="calypso" label="Calypso Wind" icon="🌬" />
+        <DevBtn type="kestrel" label="Kestrel 5700" icon="🌡" />
+        <DevBtn type="sigKilo" label="Sig Kilo 3K" icon="🎯" />
+        {status && <div style={{ color: C.dim, fontSize: 11, marginTop: 6, textAlign: "center" }}>{status}</div>}
+      </div>
+      {weather.temp !== null && (
+        <div style={sCard}>
+          <div style={{ color: C.accent, fontSize: 13, fontWeight: 700, marginBottom: 6 }}>Live Weather ({weather.source})</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 4, fontSize: 12, color: C.dim }}>
+            {weather.temp !== null && <div>Temp: <span style={{ color: C.text }}>{weather.temp.toFixed(1)}°F</span></div>}
+            {weather.pressure !== null && <div>Baro: <span style={{ color: C.text }}>{weather.pressure.toFixed(2)}"</span></div>}
+            {weather.humidity !== null && <div>Hum: <span style={{ color: C.text }}>{weather.humidity.toFixed(0)}%</span></div>}
+            {weather.windSpeed !== null && <div>Wind: <span style={{ color: C.text }}>{weather.windSpeed.toFixed(1)} mph</span></div>}
+            {weather.windDir !== null && <div>Dir: <span style={{ color: C.text }}>{weather.windDir.toFixed(0)}°</span></div>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ============================================================================
+// BALLISTIC ENGINE — TM22 Reference Curve + G1 Fallback
+// ============================================================================
+const STD_SPEED_OF_SOUND = 1116.4;
+const GRAVITY_IPSQ = 386.4;
+const DRAG_C_STD = (0.5 * 0.002378 * Math.PI * 32.174) / (4 * 144);
+
+const G1_TABLE = [
+  [0,0.2629],[0.05,0.2558],[0.1,0.2487],[0.15,0.2413],[0.2,0.2344],[0.25,0.2278],
+  [0.3,0.2214],[0.35,0.2155],[0.4,0.2104],[0.45,0.2061],[0.5,0.2032],[0.55,0.202],
+  [0.6,0.2034],[0.65,0.2165],[0.7,0.223],[0.725,0.2313],[0.75,0.2417],[0.775,0.2546],
+  [0.8,0.2706],[0.825,0.2901],[0.85,0.3136],[0.875,0.3415],[0.9,0.3734],[0.925,0.4084],
+  [0.95,0.4448],[0.975,0.4805],[1,0.5067],[1.025,0.5191],[1.05,0.52],[1.075,0.515],
+  [1.1,0.5063],[1.125,0.495],[1.15,0.483],[1.2,0.459],[1.25,0.437],[1.3,0.418],
+  [1.35,0.401],[1.4,0.386],[1.45,0.373],[1.5,0.361],[1.55,0.35],[1.6,0.34],
+];
+
+// TM22 Reference Drag Curve — 22LR round-nose heeled bullet
+// Empirical core (Mach 0.735–0.838): CZD + SK Std+ field data, Sessions 1–3
+// Short-range scaffolding (>0.838): G7-shape × TM22/G7 ratio (0.549 avg)
+// Long-range scaffolding (<0.735): G1-shape extrapolation
+// Solver finds BC ~0.10-0.13 (near real) vs G1's 0.43-0.56 (inflated 3-4×)
+// Solver noise reduced 77% vs G1 at short range
+const TM22_TABLE = [
+  // === TM22 v2 — AB Doppler lab curve (SK Match), polynomial-smoothed ===
+  // Field-validated against 6 empirical points (SK Rifle Match, Sessions 1-3)
+  // Mach 0.625–0.875: AB lab data via degree-5 polynomial fit to velocity profile
+  // Edges: G7-shape scaffolding (bullet rarely visits these Mach ranges in competition)
+  [0.500, 0.0638],  // Scaffolding
+  [0.550, 0.0638],  // Scaffolding
+  [0.600, 0.0638],  // Scaffolding
+  [0.625, 0.0647],  // AB Lab
+  [0.650, 0.0656],  // AB Lab
+  [0.675, 0.0662],  // AB Lab
+  [0.700, 0.0664],  // AB Lab
+  [0.725, 0.0665],  // AB Lab
+  [0.750, 0.0668],  // AB Lab
+  [0.775, 0.0672],  // AB Lab
+  [0.800, 0.0682],  // AB Lab
+  [0.825, 0.0696],  // AB Lab
+  [0.850, 0.0716],  // AB Lab
+  [0.875, 0.0743],  // AB Lab
+  [0.900, 0.0829],  // Scaffolding (transition)
+  [0.925, 0.0940],  // Scaffolding
+  [0.950, 0.1169],  // Scaffolding
+  [0.975, 0.1713],  // Scaffolding
+  [1.000, 0.2188],  // Scaffolding
+];
+
+function lookupCd(table, mach) {
+  if (mach <= table[0][0]) return table[0][1];
+  if (mach >= table[table.length - 1][0]) return table[table.length - 1][1];
+  for (let i = 0; i < table.length - 1; i++) {
+    if (mach >= table[i][0] && mach <= table[i + 1][0]) {
+      const f = (mach - table[i][0]) / (table[i + 1][0] - table[i][0]);
+      return table[i][1] + f * (table[i + 1][1] - table[i][1]);
+    }
+  }
+  return table[0][1];
+}
+
+function calculateDrop(params, cdTable = G1_TABLE) {
+  const { distance, muzzleVelocity, bc, zeroRange, scopeHeight,
+    temperature = 59, densityAltitude = 0, mvActual = false } = params;
+  const getCd = (m) => lookupCd(cdTable, m);
+  const adjustedMV = mvActual ? muzzleVelocity : muzzleVelocity + (temperature - 59) * 0.8;
+  const rhoRatio = Math.pow(1 - densityAltitude / 145442, 4.256);
+  const Cf = DRAG_C_STD * rhoRatio;
+  const sos = STD_SPEED_OF_SOUND * Math.sqrt((temperature + 459.67) / 518.67);
+  const dx = 0.5;
+  const maxFeet = Math.max(distance, zeroRange) * 3 + 3;
+  let v = adjustedMV, t = 0, distFt = 0;
+  let zeroGDrop = 0, targGDrop = 0, targV = adjustedMV, targT = 0;
+  let gotZero = false, gotTarget = false;
+  while (distFt <= maxFeet) {
+    const yds = distFt / 3;
+    if (!gotZero && yds >= zeroRange - 0.17) { zeroGDrop = 0.5 * GRAVITY_IPSQ * t * t; gotZero = true; }
+    if (!gotTarget && yds >= distance - 0.17) { targV = v; targT = t; targGDrop = 0.5 * GRAVITY_IPSQ * t * t; gotTarget = true; }
+    if (gotZero && gotTarget) break;
+    const mach = v / sos;
+    v += (-Cf * getCd(mach) * v / bc) * dx;
+    if (v < 50) v = 50;
+    t += dx / v;
+    distFt += dx;
+  }
+  const scopeAngle = Math.atan((zeroGDrop + scopeHeight) / (zeroRange * 36));
+  const boreLineHeight = Math.tan(scopeAngle) * (distance * 36);
+  const corrInches = targGDrop + scopeHeight - boreLineHeight;
+  const dropMils = (corrInches / (distance * 36)) * 1000;
+  const dropMOA = (corrInches / distance) * 95.5;
+  return { dropMils, dropMOA, dropInches: corrInches, velocity: targV, mach: targV / sos, tof: targT, adjustedMV };
+}
+
+function calcVelocityAtDist(distance, mv, bc, cdTable = G1_TABLE, temperature = 59, densityAltitude = 0, mvActual = false) {
+  const getCd = (m) => lookupCd(cdTable, m);
+  const adjustedMV = mvActual ? mv : mv + (temperature - 59) * 0.8;
+  const rhoRatio = Math.pow(1 - densityAltitude / 145442, 4.256);
+  const Cf = DRAG_C_STD * rhoRatio;
+  const sos = STD_SPEED_OF_SOUND * Math.sqrt((temperature + 459.67) / 518.67);
+  const dx = 0.5; let v = adjustedMV, distFt = 0;
+  while (distFt < distance * 3) {
+    v += (-Cf * getCd(v / sos) * v / bc) * dx;
+    if (v < 50) v = 50; distFt += dx;
+  }
+  return v;
+}
+
+function solveBcFromDialUp(dialUpMils, distance, zeroRange, scopeHeight, mv, temp, da, cdTable = G1_TABLE) {
+  if (dialUpMils <= 0) return { bc: 0.135, clamped: "negative" };
+  let lo = 0.01, hi = cdTable === TM22_TABLE ? 0.5 : 0.8;
+  const hiCheck = calculateDrop({ distance, muzzleVelocity: mv, bc: hi, zeroRange, scopeHeight, temperature: temp, densityAltitude: da }, cdTable);
+  const loCheck = calculateDrop({ distance, muzzleVelocity: mv, bc: lo, zeroRange, scopeHeight, temperature: temp, densityAltitude: da }, cdTable);
+  if (dialUpMils < hiCheck.dropMils) return { bc: hi, clamped: "high", expected: hiCheck.dropMils };
+  if (dialUpMils > loCheck.dropMils) return { bc: lo, clamped: "low", expected: loCheck.dropMils };
+  for (let i = 0; i < 80; i++) {
+    const mid = (lo + hi) / 2;
+    const r = calculateDrop({ distance, muzzleVelocity: mv, bc: mid, zeroRange, scopeHeight, temperature: temp, densityAltitude: da }, cdTable);
+    if (Math.abs(r.dropMils - dialUpMils) < 0.003) return { bc: mid };
+    if (r.dropMils < dialUpMils) hi = mid; else lo = mid;
+  }
+  return { bc: (lo + hi) / 2 };
+}
+
+// ============================================================================
+// STEPPED BC — Interpolated flat BC by distance (legacy engine)
+// ============================================================================
+function lookupSteppedBc(distance, table) {
+  if (!table || table.length === 0) return null;
+  const sorted = [...table].sort((a, b) => a.distance - b.distance);
+  const d = parseFloat(distance);
+  if (d <= sorted[0].distance) return sorted[0].bc;
+  if (d >= sorted[sorted.length - 1].distance) return sorted[sorted.length - 1].bc;
+  for (let i = 0; i < sorted.length - 1; i++) {
+    if (d >= sorted[i].distance && d <= sorted[i + 1].distance) {
+      const r = (d - sorted[i].distance) / (sorted[i + 1].distance - sorted[i].distance);
+      return sorted[i].bc + r * (sorted[i + 1].bc - sorted[i].bc);
+    }
+  }
+  return sorted[0].bc;
+}
+
+// ============================================================================
+// SINGLE TM22 BC SOLVER — One BC fits all points across all conditions
+// Golden section search minimizing total squared error against TM22 curve
+// Each point evaluated under ITS OWN conditions (temp, DA, MV)
+// ============================================================================
+function solveSingleTM22Bc(points) {
+  if (!points || points.length === 0) return null;
+  // Build evaluation list from truing points that have full condition snapshots
+  const evalPts = points.filter(p => p.conditions && p.corrMils > 0 && p.distance > 0).map(p => ({
+    dist: p.distance,
+    dial: p.corrMils,
+    mv: p.conditions.mv || p.conditions.profileMV || 1056,
+    // If chrono'd (mv !== profileMV), disable temp comp by using temp=59
+    temp: (p.conditions.mv && p.conditions.profileMV && Math.abs(p.conditions.mv - p.conditions.profileMV) > 3) ? 59 : (p.conditions.temp || 59),
+    da: p.conditions.da || 0,
+    zero: p.conditions.zeroDistance || 50,
+    sh: p.conditions.scopeHeight || 2.6,
+    lowConf: p.lowConf
+  }));
+  if (evalPts.length === 0) return null;
+  // Weight: high-conf points count full, low-conf half
+  const cost = (bc) => {
+    let sum = 0;
+    for (const p of evalPts) {
+      const r = calculateDrop({
+        distance: p.dist, muzzleVelocity: p.mv, bc,
+        zeroRange: p.zero, scopeHeight: p.sh,
+        temperature: p.temp, densityAltitude: p.da
+      }, TM22_TABLE);
+      const w = p.lowConf ? 0.5 : 1.0;
+      sum += w * (r.dropMils - p.dial) ** 2;
+    }
+    return sum;
+  };
+  // Golden section search
+  let lo = 0.01, hi = 0.15;
+  for (let i = 0; i < 80; i++) {
+    const m1 = lo + (hi - lo) * 0.382, m2 = lo + (hi - lo) * 0.618;
+    if (cost(m1) < cost(m2)) hi = m2; else lo = m1;
+  }
+  const bc = (lo + hi) / 2;
+  // Compute residuals for display
+  let sumErr = 0, maxErr = 0;
+  const resid = evalPts.map(p => {
+    const r = calculateDrop({
+      distance: p.dist, muzzleVelocity: p.mv, bc,
+      zeroRange: p.zero, scopeHeight: p.sh,
+      temperature: p.temp, densityAltitude: p.da
+    }, TM22_TABLE);
+    const err = r.dropMils - p.dial;
+    sumErr += Math.abs(err); if (Math.abs(err) > maxErr) maxErr = Math.abs(err);
+    return { dist: p.dist, predicted: r.dropMils, actual: p.dial, error: err };
+  });
+  return {
+    bc,
+    avgError: sumErr / evalPts.length,
+    maxError: maxErr,
+    numPoints: evalPts.length,
+    residuals: resid
+  };
+}
+
+// ============================================================================
+// SPIN DRIFT — Miller formula + scope cant effect
+// ============================================================================
+// Miller spin drift: Sd = 1.25 * (SG + 1.2) * TOF^1.83
+// SG (gyroscopic stability) = (30 * m) / (t^2 * d^3 * l * (1 + l^2))
+//   m = bullet mass (grains), t = twist (calibers/turn), d = bullet dia (in)
+//   l = bullet length / bullet diameter
+// For 22LR: d=0.224", typical 40gr bullet length ~0.43"
+function calcSpinDrift(tof, twistRateInches, bulletWeightGr, bulletDiameter = 0.224, bulletLength = 0.43) {
+  if (!tof || tof <= 0 || !twistRateInches || twistRateInches <= 0) return { driftInches: 0, driftMils: 0, sg: 0 };
+  const d = bulletDiameter;
+  const l = bulletLength / d; // length in calibers
+  const t = twistRateInches / d; // twist in calibers per turn
+  const m = bulletWeightGr;
+  // Greenhill-Miller stability factor
+  const sg = (30 * m) / (Math.pow(t, 2) * Math.pow(d, 3) * l * (1 + Math.pow(l, 2)));
+  // Miller spin drift formula (inches, positive = right for right-hand twist)
+  const sd = 1.25 * (sg + 1.2) * Math.pow(tof, 1.83);
+  return { driftInches: sd, sg };
+}
+
+function calcSpinDriftAtDist(distance, tof, twistRateInches, bulletWeightGr, twistDirection = "R", bulletDiameter = 0.224, bulletLength = 0.43) {
+  const { driftInches, sg } = calcSpinDrift(tof, twistRateInches, bulletWeightGr, bulletDiameter, bulletLength);
+  const sign = twistDirection === "R" ? 1 : -1;
+  const dMils = distance > 0 ? (driftInches / (distance * 36)) * 1000 * sign : 0;
+  const dMOA = distance > 0 ? (driftInches / distance) * 95.5 * sign : 0;
+  return { driftInches: driftInches * sign, driftMils: dMils, driftMOA: dMOA, sg };
+}
+
+// Scope cant effect: when scope is canted by angle θ, elevation dial-up creates horizontal shift
+// Horizontal shift = elevation (MIL) * sin(cant_angle_rad)
+// Vertical loss = elevation * (1 - cos(cant_angle_rad))  [negligible for small angles]
+function calcCantEffect(elevationMils, cantAngleDeg) {
+  if (!elevationMils || !cantAngleDeg) return { horizontalMils: 0, verticalLossMils: 0 };
+  const cantRad = cantAngleDeg * Math.PI / 180;
+  return {
+    horizontalMils: elevationMils * Math.sin(cantRad),
+    verticalLossMils: elevationMils * (1 - Math.cos(cantRad))
+  };
+}
+
+// ============================================================================
+// CONFIDENCE ZONE — classify distance reliability
+// ============================================================================
+function getConfZone(dist, zeroRange = 50) {
+  const minTrue = zeroRange * 2.5;
+  if (dist < minTrue) return { zone: "SHORT", color: "#eab308", label: "Low Conf", tip: "Solver noisy below " + minTrue + "yd" };
+  if (dist <= 130) return { zone: "SHORT-MID", color: "#f59e0b", label: "Fair", tip: "Transition zone" };
+  if (dist <= 250) return { zone: "MID", color: "#22c55e", label: "High Conf", tip: "Sweet spot — best accuracy" };
+  if (dist <= 302) return { zone: "LONG", color: "#3b82f6", label: "Good", tip: "Validated to 302yd" };
+  return { zone: "EXTRAP", color: "#ef4444", label: "Extrapolated", tip: "Beyond validated range" };
+}
+
+// ============================================================================
+// TM22 Display — Mach-indexed factor view
+// ============================================================================
+function normalizeGroupMOA(grpSize, grpUnit, distance) {
+  const g = parseFloat(grpSize) || 0;
+  if (g <= 0) return 0;
+  if (grpUnit === "MIL") return g * 3.438;
+  if (grpUnit === "IN") return distance > 0 ? (g / distance) * 95.5 : 0;
+  return g;
+}
+
+function buildTM22Display(points, baseBc) {
+  if (!points || points.length === 0 || !baseBc || baseBc <= 0) return null;
+  const raw = points
+    .filter(p => p.bc > 0 && p.mach > 0)
+    .map(p => {
+      const factor = p.factor || (p.bc / baseBc);
+      const shots = p.shots || 5;
+      const grpMOA = normalizeGroupMOA(p.grpSize, p.grpUnit, p.distance) || 3;
+      const weight = Math.sqrt(shots) / Math.max(grpMOA, 0.3);
+      return { mach: p.mach, factor, weight, lowConf: p.lowConf || false };
+    });
+  if (raw.length === 0) return null;
+  const MACH_BAND = 0.015;
+  raw.sort((a, b) => b.mach - a.mach);
+  const merged = [];
+  let i = 0;
+  while (i < raw.length) {
+    let sumF = raw[i].factor * raw[i].weight, sumW = raw[i].weight;
+    let sumM = raw[i].mach * raw[i].weight, count = 1, anyLow = raw[i].lowConf;
+    let j = i + 1;
+    while (j < raw.length && raw[i].mach - raw[j].mach <= MACH_BAND) {
+      sumF += raw[j].factor * raw[j].weight; sumW += raw[j].weight;
+      sumM += raw[j].mach * raw[j].weight; count++;
+      if (raw[j].lowConf) anyLow = true; j++;
+    }
+    merged.push({ mach: sumM / sumW, factor: sumF / sumW, weight: sumW, count, lowConf: anyLow });
+    i = j;
+  }
+  return merged;
+}
+
+// ============================================================================
+// CLOCK/DIRECTION HELPERS
+// ============================================================================
+function fmtClock(v) {
+  if (v === "" || v === undefined || v === null) return "";
+  const s = String(v);
+  if (s.includes(":")) return s;
+  const n = parseFloat(s);
+  if (isNaN(n)) return s;
+  const h = Math.floor(n);
+  const m = Math.round((n - h) * 60);
+  return `${h}:${m.toString().padStart(2, "0")}`;
+}
+function parseClock(s) {
+  if (!s) return 0;
+  const str = String(s);
+  if (str.includes(":")) { const [h, m] = str.split(":"); return (parseFloat(h) || 0) + (parseFloat(m) || 0) / 60; }
+  return parseFloat(str) || 0;
+}
+
+// ============================================================================
+// THEME
+// ============================================================================
+const C = {
+  bg: "#0f172a", card: "#1e293b", border: "#334155", text: "#f1f5f9",
+  dim: "#94a3b8", accent: "#ea580c", green: "#22c55e", yellow: "#eab308", red: "#ef4444",
+  blue: "#3b82f6", inputBg: "#0f172a",
+};
+const sCard = { background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: 12, marginBottom: 10 };
+const sInput = { background: C.inputBg, border: `1px solid ${C.border}`, borderRadius: 6, padding: "8px 10px", color: C.text, fontSize: 14, width: "100%", boxSizing: "border-box" };
+const sBtn = { background: C.accent, color: "#fff", border: "none", borderRadius: 6, padding: "10px 16px", fontSize: 14, fontWeight: 600, cursor: "pointer", minHeight: 44 };
+const sBtnSm = { ...sBtn, padding: "6px 12px", fontSize: 12 };
+const sLabel = { color: C.dim, fontSize: 11, marginBottom: 2, display: "block", textTransform: "uppercase", letterSpacing: 0.5 };
+
+const InputRow = ({ label, value, onChange, step, type = "text", inputMode, placeholder }) => (
+  <div style={{ flex: 1, minWidth: 70 }}>
+    <label style={sLabel}>{label}</label>
+    <input style={sInput} type="text" inputMode={inputMode || (type === "number" ? "decimal" : "text")} value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder} />
+  </div>
+);
+const UnitPicker = ({ value, onChange, options }) => (
+  <div style={{ minWidth: 55 }}>
+    <label style={sLabel}>&nbsp;</label>
+    <select style={{ ...sInput, padding: "8px 4px", fontSize: 13 }} value={value} onChange={e => onChange(e.target.value)}>
+      {options.map(o => <option key={o} value={o}>{o}</option>)}
+    </select>
+  </div>
+);
+
+// ============================================================================
+// AMMO DATABASE
+// ============================================================================
+const AMMO_DB = {
+  SK: ["Standard Plus","Rifle Match","Long Range Match","Flatnose"],
+  Lapua: ["Center-X","Midas+","X-Act","Polar Biathlon","Club"],
+  Eley: ["Tenex","Match","Club","Contact","Force"],
+  CCI: ["Standard Velocity","Green Tag","Pistol Match","Blazer"],
+  Federal: ["Gold Medal","Champion","Auto Match","Ultra Match"],
+  RWS: ["R50","R100","Rifle Match","Target Rifle"],
+  Other: ["Custom"]
+};
+const MFRS = Object.keys(AMMO_DB);
+
+// ============================================================================
+// PROFILES TAB
+// ============================================================================
+function ProfilesTab({ rifles, setRifles, ammo, setAmmo }) {
+  const [showRF, setShowRF] = useState(false);
+  const [showAF, setShowAF] = useState(false);
+  const [editId, setEditId] = useState(null);
+  const [exp, setExp] = useState(null);
+  const blankR = { name:"", zeroDistance:"50", scopeHeight:"2.6", barrelLength:"20", turretClickSize:"0.25", turretUnit:"MIL", twistRate:"16", twistDir:"R", trackingCorrection:"1.000" };
+  const blankA = { profileName:"", name:"", manufacturer:"SK", lotNumber:"", muzzleVelocity:"1056", baseBc:"0.135", bulletWeight:"40", mvSD:"8", mvES:"28", groupSize:"1.5", groupUnit:"MOA" };
+  const [rf, setRf] = useState(blankR);
+  const [af, setAf] = useState(blankA);
+
+  const saveR = () => { if (!rf.name.trim()) return; if (editId) setRifles(rifles.map(r=>r.id===editId?{...rf,id:editId}:r)); else setRifles([...rifles,{...rf,id:Date.now().toString()}]); setRf(blankR); setShowRF(false); setEditId(null); };
+  const saveA = () => { if (!af.profileName.trim()&&!af.name.trim()) return; if (editId) setAmmo(ammo.map(a=>a.id===editId?{...af,id:editId}:a)); else setAmmo([...ammo,{...af,id:Date.now().toString()}]); setAf(blankA); setShowAF(false); setEditId(null); };
+
+  return (
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+        <span style={{color:C.text,fontSize:16,fontWeight:600}}>Rifles ({rifles.length})</span>
+        <button style={sBtnSm} onClick={()=>{setShowRF(!showRF);setEditId(null);setRf(blankR)}}>{showRF?"Cancel":"+ Add Rifle"}</button>
+      </div>
+      {showRF && (
+        <div style={sCard}>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:8}}>
+            <InputRow label="Rifle Name" value={rf.name} onChange={v=>setRf({...rf,name:v})} placeholder="e.g. CZD or Bergara" />
+          </div>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:8}}>
+            <InputRow label="Zero (yd)" value={rf.zeroDistance} onChange={v=>setRf({...rf,zeroDistance:v})} type="number" />
+            <InputRow label="Scope Ht (in)" value={rf.scopeHeight} onChange={v=>setRf({...rf,scopeHeight:v})} type="number" step="0.01" />
+            <InputRow label="Barrel (in)" value={rf.barrelLength} onChange={v=>setRf({...rf,barrelLength:v})} type="number" />
+          </div>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:8}}>
+            <InputRow label="Click Size" value={rf.turretClickSize} onChange={v=>setRf({...rf,turretClickSize:v})} type="number" step="0.05" />
+            <div style={{flex:1,minWidth:70}}>
+              <label style={sLabel}>Turret Unit</label>
+              <select style={sInput} value={rf.turretUnit} onChange={e=>setRf({...rf,turretUnit:e.target.value})}><option value="MIL">MIL</option><option value="MOA">MOA</option></select>
+            </div>
+            <InputRow label="Twist (in)" value={rf.twistRate} onChange={v=>setRf({...rf,twistRate:v})} type="number" />
+            <div style={{flex:1,minWidth:50}}>
+              <label style={sLabel}>Twist Dir</label>
+              <select style={sInput} value={rf.twistDir||"R"} onChange={e=>setRf({...rf,twistDir:e.target.value})}><option value="R">Right</option><option value="L">Left</option></select>
+            </div>
+          </div>
+          <button style={sBtn} onClick={saveR}>{editId?"Update Rifle":"Save Rifle"}</button>
+        </div>
+      )}
+      {rifles.map(r=>(
+        <div key={r.id} style={sCard}>
+          <div style={{display:"flex",justifyContent:"space-between",cursor:"pointer"}} onClick={()=>setExp(exp===r.id?null:r.id)}>
+            <span style={{color:C.text,fontWeight:600}}>{r.name}</span>
+            <div style={{display:"flex",gap:6,alignItems:"center"}}>
+              {parseFloat(r.trackingCorrection)!==1&&<span style={{color:C.yellow,fontSize:11}}>TRK {(parseFloat(r.trackingCorrection)*100).toFixed(1)}%</span>}
+              <span style={{color:C.dim,fontSize:11}}>{r.turretUnit||"MIL"} · {r.zeroDistance}yd</span>
+              <span style={{color:C.dim}}>{exp===r.id?"▲":"▼"}</span>
+            </div>
+          </div>
+          {exp===r.id&&(
+            <div style={{marginTop:8,borderTop:`1px solid ${C.border}`,paddingTop:8}}>
+              <div style={{color:C.dim,fontSize:12,lineHeight:1.8}}>Scope: {r.scopeHeight}in · Barrel: {r.barrelLength}in · Click: {r.turretClickSize} {r.turretUnit||"MIL"} · Twist: 1:{r.twistRate}in {r.twistDir||"R"}H · Tracking: {(parseFloat(r.trackingCorrection)*100).toFixed(1)}%</div>
+              <div style={{display:"flex",gap:6,marginTop:8}}>
+                <button style={sBtnSm} onClick={()=>{setRf(r);setEditId(r.id);setShowRF(true)}}>Edit</button>
+                <button style={{...sBtnSm,background:C.red}} onClick={()=>setRifles(rifles.filter(x=>x.id!==r.id))}>Delete</button>
+              </div>
+            </div>
+          )}
+        </div>
+      ))}
+
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,marginTop:20}}>
+        <span style={{color:C.text,fontSize:16,fontWeight:600}}>Ammo ({ammo.length})</span>
+        <button style={sBtnSm} onClick={()=>{setShowAF(!showAF);setEditId(null);setAf(blankA)}}>{showAF?"Cancel":"+ Add Ammo"}</button>
+      </div>
+      {showAF && (
+        <div style={sCard}>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:8}}>
+            <InputRow label="Profile Name" value={af.profileName} onChange={v=>setAf({...af,profileName:v})} placeholder="e.g. SK Std+ Lot 833" />
+          </div>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:8}}>
+            <div style={{flex:1,minWidth:70}}><label style={sLabel}>Manufacturer</label>
+              <select style={sInput} value={af.manufacturer} onChange={e=>setAf({...af,manufacturer:e.target.value,name:AMMO_DB[e.target.value]?.[0]||""})}>{MFRS.map(m=><option key={m} value={m}>{m}</option>)}</select>
+            </div>
+            <div style={{flex:1,minWidth:70}}><label style={sLabel}>Product</label>
+              <select style={sInput} value={af.name} onChange={e=>setAf({...af,name:e.target.value})}>{(AMMO_DB[af.manufacturer]||["Custom"]).map(p=><option key={p} value={p}>{p}</option>)}</select>
+            </div>
+          </div>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:8}}>
+            <InputRow label="Lot #" value={af.lotNumber} onChange={v=>setAf({...af,lotNumber:v})} placeholder="4820-1102" />
+            <InputRow label="MV (fps)" value={af.muzzleVelocity} onChange={v=>setAf({...af,muzzleVelocity:v})} type="number" />
+            <InputRow label="Weight (gr)" value={af.bulletWeight} onChange={v=>setAf({...af,bulletWeight:v})} type="number" />
+          </div>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:8}}>
+            <div style={{flex:1,minWidth:70}}><label style={sLabel}>Drag Model</label>
+              <div style={{background:C.border,borderRadius:4,padding:"8px 10px",fontSize:13,color:C.accent,textAlign:"center",fontWeight:600}}>TM22</div>
+            </div>
+            <InputRow label="Base BC" value={af.baseBc} onChange={v=>setAf({...af,baseBc:v})} type="number" step="0.001" />
+          </div>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:8}}>
+            <InputRow label="MV SD (fps)" value={af.mvSD} onChange={v=>setAf({...af,mvSD:v})} type="number" />
+            <InputRow label="MV ES (fps)" value={af.mvES} onChange={v=>setAf({...af,mvES:v})} type="number" />
+          </div>
+          <button style={sBtn} onClick={saveA}>{editId?"Update Ammo":"Save Ammo"}</button>
+        </div>
+      )}
+      {ammo.map(a=>(
+        <div key={a.id} style={sCard}>
+          <div style={{display:"flex",justifyContent:"space-between",cursor:"pointer"}} onClick={()=>setExp(exp===a.id?null:a.id)}>
+            <span style={{color:C.text,fontWeight:600}}>{a.profileName||`${a.manufacturer} ${a.name}`}</span>
+            <div style={{display:"flex",gap:6,alignItems:"center"}}>
+              {a.lotNumber&&<span style={{color:C.dim,fontSize:10}}>Lot:{a.lotNumber}</span>}
+              <span style={{color:C.dim,fontSize:11}}>{a.muzzleVelocity}fps</span>
+              <span style={{color:C.dim}}>{exp===a.id?"▲":"▼"}</span>
+            </div>
+          </div>
+          {exp===a.id&&(
+            <div style={{marginTop:8,borderTop:`1px solid ${C.border}`,paddingTop:8}}>
+              <div style={{color:C.dim,fontSize:12,lineHeight:1.8}}>
+                {a.manufacturer} {a.name} · {a.bulletWeight}gr · BC {a.baseBc} TM22
+                {a.lotNumber?` · Lot: ${a.lotNumber}`:""} · SD: {a.mvSD}fps{a.mvES?` · ES: ${a.mvES}fps`:""}
+              </div>
+              <div style={{display:"flex",gap:6,marginTop:8}}>
+                <button style={sBtnSm} onClick={()=>{setAf({...a,groupSize:a.groupSize||"1.5",groupUnit:a.groupUnit||"MOA"});setEditId(a.id);setShowAF(true)}}>Edit</button>
+                <button style={{...sBtnSm,background:C.red}} onClick={()=>setAmmo(ammo.filter(x=>x.id!==a.id))}>Delete</button>
+              </div>
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ============================================================================
+// TRUING TAB — Session data collection + BC solving
+// ============================================================================
+function TruingTab({ rifles, ammo, setRifles, truingData, setTruingData }) {
+  const TRUING_PERSIST_KEY = "tm22_truing_session";
+  const loadTruingSession = () => {
+    try { return JSON.parse(localStorage.getItem(TRUING_PERSIST_KEY)) || {}; } catch { return {}; }
+  };
+  const saved = loadTruingSession();
+  const [selR, setSelR] = useState(saved.selR || "");
+  const [selA, setSelA] = useState(saved.selA || "");
+  const [tTemp, setTTemp] = useState(saved.tTemp || "59");
+  const [tDa, setTDa] = useState(saved.tDa || "0");
+  const [tMV, setTMV] = useState(saved.tMV || "");
+  const [nDist, setNDist] = useState("");
+  const [nDial, setNDial] = useState("");
+  const [nDialUnit, setNDialUnit] = useState(saved.nDialUnit || "MIL");
+  const [nShots, setNShots] = useState("10");
+  const [nGrp, setNGrp] = useState("1.5");
+  const [nGrpUnit, setNGrpUnit] = useState("MOA");
+  const [err, setErr] = useState("");
+  const [editPt, setEditPt] = useState(null);
+  const [collMode, setCollMode] = useState(false);
+  const defaultLadder = [75,100,125,150,175,200,225,250,275,302];
+  const [collRows, setCollRows] = useState(()=>defaultLadder.map(d=>({dist:d,dial:"",shots:"10",grp:"",grpUnit:"MOA"})));
+  const [collNote, setCollNote] = useState("");
+  const [ttDist, setTtDist] = useState("100");
+  const [ttDialed, setTtDialed] = useState("10.0");
+  const [ttDialUnit, setTtDialUnit] = useState("MIL");
+  const [ttMeas, setTtMeas] = useState("");
+  const [ttMeasUnit, setTtMeasUnit] = useState("IN");
+  const [ttMsg, setTtMsg] = useState("");
+
+  // Persist selections across tab switches and app restarts
+  useEffect(() => {
+    localStorage.setItem(TRUING_PERSIST_KEY, JSON.stringify({ selR, selA, tTemp, tDa, tMV, nDialUnit }));
+  }, [selR, selA, tTemp, tDa, tMV, nDialUnit]);
+
+  // Auto-select if only one rifle/ammo exists and nothing selected
+  useEffect(() => {
+    if (!selR && rifles.length === 1) setSelR(rifles[0].id);
+    else if (selR && !rifles.find(r=>r.id===selR)) setSelR(rifles.length?rifles[0].id:"");
+    if (!selA && ammo.length === 1) setSelA(ammo[0].id);
+    else if (selA && !ammo.find(a=>a.id===selA)) setSelA(ammo.length?ammo[0].id:"");
+  }, [rifles, ammo]);
+
+  const rifle = rifles.find(r=>r.id===selR);
+  const am = ammo.find(a=>a.id===selA);
+  const pk = selR&&selA?`${selR}_${selA}`:null;
+  const pd = pk?(truingData[pk]||{points:[]}):({points:[]});
+  const tc = rifle?parseFloat(rifle.trackingCorrection)||1:1;
+  const da = tDa!==""&&!isNaN(parseFloat(tDa))?parseFloat(tDa):0;
+
+  // Tall target
+  const ttDistN = parseFloat(ttDist)||100;
+  const ttDialN = parseFloat(ttDialed)||0;
+  const ttExpIn = ttDialUnit==="MOA"?(ttDialN/95.5)*ttDistN:ttDialN*ttDistN*0.036;
+  const ttMeasN = parseFloat(ttMeas)||0;
+  const ttMeasIn = ttMeasUnit==="IN"?ttMeasN:ttMeasUnit==="MIL"?ttMeasN*ttDistN*0.036:(ttMeasN/95.5)*ttDistN;
+  const ttFact = ttMeasIn>0?ttMeasIn/ttExpIn:null;
+  const ttPct = ttFact?(ttFact*100):null;
+  const ttClr = ttPct?(ttPct>=98&&ttPct<=102?C.green:ttPct>=95&&ttPct<=105?C.yellow:C.red):C.dim;
+  const saveTT = () => { if(!rifle||!ttFact) return; setRifles(rifles.map(r=>r.id===selR?{...r,trackingCorrection:ttFact.toFixed(4)}:r)); setTtMsg(`Tracking ${(ttFact*100).toFixed(1)}% saved`); setTimeout(()=>setTtMsg(""),3000); };
+
+  const updateTruing = (fn) => {
+    setTruingData(prev => {
+      const prevPd = pk ? (prev[pk] || { points: [] }) : { points: [] };
+      return { ...prev, [pk]: fn(prevPd) };
+    });
+  };
+
+  const [ptWarning, setPtWarning] = useState(null); // {msg, pt} — pending point awaiting confirmation
+
+  const validatePoint = (dist, corrMils, solved, mvUse) => {
+    const warnings = [];
+    // 1. Solved BC clamped
+    if (solved.clamped === "high") warnings.push("BC hit upper limit 0.5 — dial-up too low for this distance");
+    if (solved.clamped === "low") warnings.push("BC hit lower limit 0.01 — dial-up too high for this distance");
+    if (solved.clamped === "negative") warnings.push("Negative BC — impossible, check your dial-up sign");
+    // 2. Factor way outside normal range (expect 0.2–0.8 for TM22)
+    const baseBcN = parseFloat(am.baseBc);
+    if (baseBcN > 0) {
+      const factor = solved.bc / baseBcN;
+      if (factor > 1.0) warnings.push(`Factor ×${factor.toFixed(2)} — BC higher than base profile, very unusual`);
+      if (factor < 0.15) warnings.push(`Factor ×${factor.toFixed(2)} — extremely low BC, likely a misread`);
+    }
+    // 3. If we have existing single BC, check against prediction
+    const existingPts = pd.points.filter(p => p.corrMils > 0 && p.distance > 0);
+    if (existingPts.length >= 3) {
+      const sbr = solveSingleTM22Bc(existingPts);
+      if (sbr) {
+        const tempUse = (tMV && am && Math.abs(parseFloat(tMV) - parseFloat(am.muzzleVelocity)) > 3) ? 59 : parseFloat(tTemp);
+        const pred = calculateDrop({distance: dist, muzzleVelocity: mvUse, bc: sbr.bc, zeroRange: parseFloat(rifle.zeroDistance), scopeHeight: parseFloat(rifle.scopeHeight), temperature: tempUse, densityAltitude: da}, TM22_TABLE);
+        const delta = Math.abs(corrMils - pred.dropMils);
+        if (delta > 0.5) warnings.push(`Off by ${delta.toFixed(2)} MIL from current BC ${sbr.bc.toFixed(4)} prediction (${pred.dropMils.toFixed(2)} expected) — possible misread or wrong distance`);
+        else if (delta > 0.3) warnings.push(`${delta.toFixed(2)} MIL from expected ${pred.dropMils.toFixed(2)} — check your reading`);
+      }
+    }
+    // 4. Dial-up sanity vs distance
+    if (dist > 100 && corrMils < 1.0) warnings.push("Dial-up very low for this distance — did you read the right target?");
+    if (dist < 100 && corrMils > 5.0) warnings.push("Dial-up very high for this distance — check units");
+    if (dist > 250 && corrMils < 5.0) warnings.push("Dial-up suspiciously low beyond 250yd");
+    return warnings;
+  };
+
+  const addPt = () => {
+    setErr("");setPtWarning(null);
+    if(!rifle||!am){setErr("Select rifle and ammo");return;}
+    if(!nDist||!nDial){setErr("Enter distance and dial-up");return;}
+    try{
+      const dist=parseFloat(nDist), rawDial=parseFloat(nDial);
+      if(isNaN(dist)||isNaN(rawDial)||dist<=0){setErr("Invalid values");return;}
+      if(rawDial<=0){setErr("Dial-up must be positive — negative means bullet hit above aim point");return;}
+      const zeroD = parseFloat(rifle.zeroDistance) || 50;
+      let lowConf = dist < zeroD * 2.5;
+      const dialMils = nDialUnit==="MOA"?rawDial*0.2909:nDialUnit==="IN"?(rawDial/(dist*36))*1000:rawDial;
+      const corrMils = dialMils / tc;
+      const mvUse = tMV?parseFloat(tMV):parseFloat(am.muzzleVelocity);
+      const solved = solveBcFromDialUp(corrMils,dist,parseFloat(rifle.zeroDistance),parseFloat(rifle.scopeHeight),mvUse,parseFloat(tTemp),da, TM22_TABLE);
+      if (solved.clamped) { lowConf = true; }
+      // Validate
+      const warnings = validatePoint(dist, corrMils, solved, mvUse);
+      const vel = calcVelocityAtDist(dist,mvUse,solved.bc, TM22_TABLE, parseFloat(tTemp), da);
+      const localSos = STD_SPEED_OF_SOUND * Math.sqrt((parseFloat(tTemp) + 459.67) / 518.67);
+      const baseBcN = parseFloat(am.baseBc);
+      const factor = baseBcN > 0 ? solved.bc / baseBcN : 1;
+      const pt = {
+        id: editPt || Date.now().toString(),
+        timestamp: new Date().toISOString(),
+        distance: dist, rawDial, dialUnit: nDialUnit, dialMils, corrMils,
+        bc: solved.bc, factor, lowConf,
+        velocity: vel, mach: vel / localSos,
+        shots: parseInt(nShots) || 10, grpSize: parseFloat(nGrp) || 0, grpUnit: nGrpUnit,
+        conditions: { temp: parseFloat(tTemp), da, mv: mvUse, profileMV: parseFloat(am.muzzleVelocity), trackingCorr: tc, zeroDistance: parseFloat(rifle.zeroDistance), scopeHeight: parseFloat(rifle.scopeHeight), bcModel: "TM22", baseBc: parseFloat(am.baseBc) }
+      };
+      if (warnings.length > 0) {
+        setPtWarning({ msgs: warnings, pt });
+        return; // Don't save yet — user must confirm
+      }
+      commitPoint(pt);
+    }catch(e){setErr("Solve failed: "+e.message);}
+  };
+
+  const commitPoint = (pt) => {
+    updateTruing(prevPd => {
+      const pts = editPt ? prevPd.points.filter(x => x.id !== editPt) : prevPd.points;
+      return { ...prevPd, points: [...pts, pt].sort((a, b) => a.distance - b.distance) };
+    });
+    setNDist("");setNDial("");setNShots("10");setNGrp("1.5");setEditPt(null);setPtWarning(null);
+  };
+
+  const deletePt = (pid) => updateTruing(prevPd => ({ ...prevPd, points: prevPd.points.filter(x => x.id !== pid) }));
+  const [confirmClear, setConfirmClear] = useState(false);
+  const clearAll = () => { if(!confirmClear){ setConfirmClear(true); setTimeout(()=>setConfirmClear(false),3000); return; } updateTruing(()=>({points:[]})); setConfirmClear(false); };
+
+  const saveCollection = () => {
+    setErr("");
+    if(!rifle||!am){setErr("Select rifle and ammo");return;}
+    const sessionId = Date.now().toString();
+    const mvUse = tMV?parseFloat(tMV):parseFloat(am.muzzleVelocity);
+    const zeroD = parseFloat(rifle.zeroDistance)||50;
+    const localSos = STD_SPEED_OF_SOUND * Math.sqrt((parseFloat(tTemp) + 459.67) / 518.67);
+    const baseBcN = parseFloat(am.baseBc);
+    const newPts = [];
+    const skipped = [];
+    // Get existing single BC for prediction check
+    const existingPts = pd.points.filter(p => p.corrMils > 0 && p.distance > 0);
+    const sbr = existingPts.length >= 3 ? solveSingleTM22Bc(existingPts) : null;
+    for(const row of collRows){
+      if(!row.dial||isNaN(parseFloat(row.dial))) continue;
+      const dist = row.dist, rawDial = parseFloat(row.dial);
+      if(rawDial<=0) { skipped.push(`${dist}yd: negative dial-up`); continue; }
+      const dialMils = nDialUnit==="MOA"?rawDial*0.2909:rawDial;
+      const corrMils = dialMils / tc;
+      try{
+        const solved = solveBcFromDialUp(corrMils,dist,parseFloat(rifle.zeroDistance),parseFloat(rifle.scopeHeight),mvUse,parseFloat(tTemp),da, TM22_TABLE);
+        // Skip hard garbage: clamped BC
+        if (solved.clamped === "high" || solved.clamped === "negative") {
+          skipped.push(`${dist}yd: BC clamped (${rawDial} ${nDialUnit} too ${solved.clamped==="high"?"low":"high"})`);
+          continue;
+        }
+        // Skip if factor is absurd (>2.0 = definitely garbage)
+        const factor = baseBcN > 0 ? (solved.bc||baseBcN) / baseBcN : 1;
+        if (factor > 2.0) {
+          skipped.push(`${dist}yd: factor ×${factor.toFixed(1)} — impossible, skipped`);
+          continue;
+        }
+        // Warn (but keep) if >0.5 MIL from prediction
+        let warn = false;
+        if (sbr) {
+          const tempUse = (tMV && Math.abs(parseFloat(tMV) - parseFloat(am.muzzleVelocity)) > 3) ? 59 : parseFloat(tTemp);
+          const pred = calculateDrop({distance:dist, muzzleVelocity:mvUse, bc:sbr.bc, zeroRange:parseFloat(rifle.zeroDistance), scopeHeight:parseFloat(rifle.scopeHeight), temperature:tempUse, densityAltitude:da}, TM22_TABLE);
+          if (Math.abs(corrMils - pred.dropMils) > 0.5) warn = true;
+        }
+        const vel = calcVelocityAtDist(dist,mvUse,solved.bc||baseBcN, TM22_TABLE, parseFloat(tTemp), da);
+        newPts.push({
+          id: sessionId+"_"+dist, timestamp: new Date().toISOString(), sessionId,
+          distance: dist, rawDial, dialUnit: nDialUnit, dialMils, corrMils,
+          bc: solved.bc||(solved.clamped?baseBcN:baseBcN), factor,
+          lowConf: dist < zeroD * 2.5 || !!solved.clamped || warn,
+          velocity: vel, mach: vel / localSos,
+          shots: parseInt(row.shots)||10, grpSize: parseFloat(row.grp)||0, grpUnit: row.grpUnit||"MOA",
+          conditions: { temp: parseFloat(tTemp), da, mv: mvUse, profileMV: parseFloat(am.muzzleVelocity), trackingCorr: tc, zeroDistance: parseFloat(rifle.zeroDistance), scopeHeight: parseFloat(rifle.scopeHeight), bcModel: "TM22", baseBc: baseBcN },
+          collectionNote: collNote
+        });
+      }catch(e){}
+    }
+    if(newPts.length===0&&skipped.length===0){setErr("No valid dial-ups entered");return;}
+    if(newPts.length===0&&skipped.length>0){setErr("All points rejected: "+skipped.join("; "));return;}
+    updateTruing(prevPd => ({ ...prevPd, points: [...prevPd.points, ...newPts].sort((a,b)=>a.distance-b.distance) }));
+    const msg = skipped.length > 0 ? `Saved ${newPts.length} pts. Skipped ${skipped.length}: ${skipped.join("; ")}` : "";
+    setCollRows(defaultLadder.map(d=>({dist:d,dial:"",shots:"10",grp:"",grpUnit:"MOA"})));
+    setCollNote(""); setErr(msg);
+  };
+
+  const Sel = ({label,value,onChange,items,fmt}) => (
+    <div style={{flex:1}}><label style={sLabel}>{label}</label>
+      <select style={sInput} value={value} onChange={e=>onChange(e.target.value)}><option value="">Select...</option>{items.map(i=><option key={i.id} value={i.id}>{fmt(i)}</option>)}</select>
+    </div>
+  );
+
+  const baseBcN = am ? parseFloat(am.baseBc) : 0.135;
+
+  return (
+    <div>
+      <div style={{display:"flex",gap:8,marginBottom:12}}>
+        <Sel label="Rifle" value={selR} onChange={setSelR} items={rifles} fmt={r=>r.name} />
+        <Sel label="Ammo" value={selA} onChange={setSelA} items={ammo} fmt={a=>a.profileName||`${a.manufacturer} ${a.name}`} />
+      </div>
+      {!selR||!selA?(
+        <div style={{...sCard,textAlign:"center",color:C.dim,padding:30}}>Select rifle and ammo to begin truing</div>
+      ):(
+        <>
+          {/* Scope tracking */}
+          <details style={{marginBottom:10}} open={tc===1}>
+            <summary style={{color:C.text,fontSize:14,fontWeight:600,cursor:"pointer",padding:"8px 0"}}>
+              Scope Tracking {tc!==1?<span style={{color:tc>=0.98&&tc<=1.02?C.green:C.yellow,fontSize:11,marginLeft:8}}>({(tc*100).toFixed(1)}%)</span>:<span style={{color:C.red,fontSize:11,marginLeft:8}}>(NOT TESTED)</span>}
+            </summary>
+            <div style={sCard}>
+              <div style={{color:C.dim,fontSize:11,lineHeight:1.5,marginBottom:10,background:C.bg,borderRadius:6,padding:8}}>
+                <span style={{color:C.text,fontWeight:600}}>Tall Target Test:</span> At a measured distance, dial a known amount on your turret and shoot. Measure the actual bullet displacement. If your scope tracks 100%, the measured displacement equals the expected displacement.<br/>
+                <span style={{color:C.yellow,fontWeight:600}}>Example:</span> At 100yd, dial 10 MIL up = expect 36.0". If bullet hits 34.5" high, tracking = 95.8%. The app corrects all dial-ups by this factor.
+              </div>
+              <div style={{display:"flex",gap:6,marginBottom:8,alignItems:"flex-end"}}>
+                <InputRow label="Test Dist (yd)" value={ttDist} onChange={setTtDist} inputMode="numeric" />
+                <InputRow label="Dialed" value={ttDialed} onChange={setTtDialed} inputMode="decimal" />
+                <UnitPicker value={ttDialUnit} onChange={setTtDialUnit} options={["MIL","MOA"]} />
+              </div>
+              {ttDialN>0 && <div style={{color:C.dim,fontSize:11,marginBottom:6}}>Expected displacement: <span style={{color:C.text,fontWeight:600}}>{ttExpIn.toFixed(1)}"</span> at {ttDistN}yd</div>}
+              <div style={{display:"flex",gap:6,marginBottom:8,alignItems:"flex-end"}}>
+                <InputRow label="Actual Measured" value={ttMeas} onChange={setTtMeas} placeholder="—" inputMode="decimal" />
+                <UnitPicker value={ttMeasUnit} onChange={setTtMeasUnit} options={["IN","MIL","MOA"]} />
+              </div>
+              {ttPct&&<div style={{background:C.bg,borderRadius:6,padding:10,marginBottom:8}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <span style={{color:ttClr,fontSize:18,fontWeight:700}}>Tracking: {ttPct.toFixed(1)}%</span>
+                  <span style={{color:C.dim,fontSize:11}}>Factor: {ttFact.toFixed(4)}</span>
+                </div>
+                <div style={{color:C.dim,fontSize:11,marginTop:4}}>
+                  {ttPct>=98&&ttPct<=102?<span style={{color:C.green}}>✓ Excellent — within ±2%</span>:
+                   ttPct>=95&&ttPct<=105?<span style={{color:C.yellow}}>⚠ Acceptable — correction applied to all dial-ups</span>:
+                   <span style={{color:C.red}}>✗ Poor — recheck mount torque, ring alignment, or scope quality</span>}
+                </div>
+              </div>}
+              <div style={{display:"flex",gap:6}}>
+                <button style={sBtnSm} onClick={saveTT} disabled={!ttMeas}>Save to Rifle Profile</button>
+                <button style={{...sBtnSm,background:C.border}} onClick={()=>{setRifles(rifles.map(r=>r.id===selR?{...r,trackingCorrection:"1.000"}:r));setTtMeas("")}}>Reset 1.000</button>
+              </div>
+              {ttMsg&&<div style={{color:C.green,fontSize:12,marginTop:6}}>{ttMsg}</div>}
+            </div>
+          </details>
+
+          {/* Session conditions */}
+          <div style={sCard}>
+            <div style={{color:C.dim,fontSize:11,fontWeight:600,marginBottom:6}}>SESSION CONDITIONS</div>
+            <div style={{display:"flex",gap:8,marginBottom:4}}>
+              <div style={{flex:1}}>
+                <label style={sLabel}>Chrono MV (fps)</label>
+                <input style={{...sInput, borderColor: tMV ? C.green : C.border}} inputMode="decimal" value={tMV} onChange={e=>setTMV(e.target.value)} placeholder={am?am.muzzleVelocity:"—"} />
+              </div>
+              <div style={{flex:1}}><label style={sLabel}>Temp (°F)</label><input style={sInput} inputMode="decimal" value={tTemp} onChange={e=>setTTemp(e.target.value)} /></div>
+              <div style={{flex:1}}><label style={sLabel}>DA (ft)</label><input style={sInput} inputMode="numeric" value={tDa} onChange={e=>setTDa(e.target.value)} /></div>
+            </div>
+            <div style={{fontSize:10,marginTop:4,lineHeight:1.6}}>
+              {tMV ? (
+                <span style={{color:C.green}}>✓ CHRONO: Using {tMV} fps as-is — no temp adjustment</span>
+              ) : (
+                <span style={{color:C.yellow}}>⚠ NO CHRONO: Using profile {am?.muzzleVelocity||"—"} fps + temp adj ({((parseFloat(tTemp)-59)*0.8).toFixed(1)} fps). Enter chrono'd MV for best accuracy.</span>
+              )}
+            </div>
+          </div>
+
+          {/* Mode toggle */}
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+            <div style={{color:C.text,fontSize:15,fontWeight:600}}>Truing Points</div>
+            <button style={{...sBtnSm,background:collMode?C.accent:C.border,fontSize:10}} onClick={()=>setCollMode(!collMode)}>{collMode?"Single Point":"Collection Mode"}</button>
+          </div>
+
+          {collMode?(
+            <div style={sCard}>
+              <div style={{color:C.dim,fontSize:11,fontWeight:600,marginBottom:6}}>COLLECTION — Dial-Up Ladder</div>
+              <div style={{display:"flex",gap:8,marginBottom:8}}>
+                <div style={{flex:1}}><label style={sLabel}>Dial Unit</label>
+                  <select style={sInput} value={nDialUnit} onChange={e=>setNDialUnit(e.target.value)}><option value="MIL">MIL</option><option value="MOA">MOA</option></select>
+                </div>
+                <div style={{flex:2}}><label style={sLabel}>Session Note</label>
+                  <input style={sInput} value={collNote} onChange={e=>setCollNote(e.target.value)} placeholder="e.g. Session 4, cold barrel" />
+                </div>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"55px 1fr 50px 60px 24px",gap:4,fontSize:12,marginBottom:4}}>
+                <span style={{color:C.dim,fontWeight:600,padding:"0 2px"}}>Dist</span>
+                <span style={{color:C.dim,fontWeight:600,padding:"0 2px"}}>Dial ({nDialUnit})</span>
+                <span style={{color:C.dim,fontWeight:600,padding:"0 2px"}}>Rds</span>
+                <span style={{color:C.dim,fontWeight:600,padding:"0 2px"}}>Grp</span>
+                <span></span>
+                {collRows.map((r,i)=>{
+                  const zeroD = parseFloat(rifle?.zeroDistance)||50;
+                  const conf = getConfZone(r.dist, zeroD);
+                  return (
+                    <React.Fragment key={i}>
+                      <span style={{color:conf.color,fontWeight:600,padding:"8px 2px",fontSize:13}}>{r.dist}</span>
+                      <input style={{...sInput,padding:"6px 8px",fontSize:13}} inputMode="decimal" value={r.dial} placeholder="—" onChange={e=>{const nr=[...collRows];nr[i]={...nr[i],dial:e.target.value};setCollRows(nr)}} />
+                      <input style={{...sInput,padding:"6px 4px",fontSize:12}} inputMode="numeric" value={r.shots} onChange={e=>{const nr=[...collRows];nr[i]={...nr[i],shots:e.target.value};setCollRows(nr)}} />
+                      <input style={{...sInput,padding:"6px 4px",fontSize:12}} inputMode="decimal" value={r.grp} placeholder="—" onChange={e=>{const nr=[...collRows];nr[i]={...nr[i],grp:e.target.value};setCollRows(nr)}} />
+                      <button style={{background:"transparent",border:"none",color:C.dim,cursor:"pointer",fontSize:14,padding:0}} onClick={()=>setCollRows(collRows.filter((_,j)=>j!==i))}>×</button>
+                    </React.Fragment>
+                  );
+                })}
+              </div>
+              <div style={{display:"flex",gap:6,marginBottom:8,alignItems:"flex-end"}}>
+                <input style={{...sInput,width:55,padding:"4px 6px",fontSize:12}} inputMode="numeric" placeholder="yd" id="addDistInput" />
+                <button style={{...sBtnSm,background:C.border,fontSize:10}} onClick={()=>{
+                  const inp=document.getElementById("addDistInput");
+                  const d=parseInt(inp?.value);
+                  if(d>0&&!collRows.find(r=>r.dist===d)){
+                    setCollRows([...collRows,{dist:d,dial:"",shots:"10",grp:"",grpUnit:"MOA"}].sort((a,b)=>a.dist-b.dist));
+                    if(inp) inp.value="";
+                  }
+                }}>+ Add Distance</button>
+              </div>
+              {err&&<div style={{color:C.red,fontSize:12,marginBottom:6}}>{err}</div>}
+              <button style={sBtn} onClick={saveCollection}>Save {collRows.filter(r=>r.dial).length} Points</button>
+            </div>
+          ):(
+            <div style={sCard}>
+              <div style={{display:"flex",gap:6,marginBottom:8,alignItems:"flex-end"}}>
+                <InputRow label="Distance (yd)" value={nDist} onChange={setNDist} placeholder="200" inputMode="numeric" />
+                <InputRow label="Dial-Up" value={nDial} onChange={setNDial} placeholder="1.70" inputMode="decimal" />
+                <UnitPicker value={nDialUnit} onChange={setNDialUnit} options={["MIL","MOA","IN"]} />
+              </div>
+              <div style={{display:"flex",gap:6,marginBottom:8,alignItems:"flex-end"}}>
+                <InputRow label="Shots" value={nShots} onChange={setNShots} inputMode="numeric" />
+                <InputRow label="Group Size" value={nGrp} onChange={setNGrp} inputMode="decimal" />
+                <UnitPicker value={nGrpUnit} onChange={setNGrpUnit} options={["MOA","MIL","IN"]} />
+              </div>
+              {err&&<div style={{color:C.red,fontSize:12,marginBottom:6}}>{err}</div>}
+              <div style={{display:"flex",gap:6}}>
+                <button style={sBtn} onClick={addPt}>{editPt?"Update Point":"+ Add Point"}</button>
+                {editPt&&<button style={{...sBtnSm,background:C.border}} onClick={()=>{setEditPt(null);setNDist("");setNDial("")}}>Cancel</button>}
+              </div>
+              {/* Validation warning gate */}
+              {ptWarning && (
+                <div style={{background:"#3d1f00",border:`2px solid ${C.yellow}`,borderRadius:6,padding:10,marginTop:8}}>
+                  <div style={{color:C.yellow,fontSize:12,fontWeight:700,marginBottom:6}}>⚠ CHECK YOUR DATA</div>
+                  {ptWarning.msgs.map((m,i) => <div key={i} style={{color:C.text,fontSize:11,marginBottom:4}}>• {m}</div>)}
+                  <div style={{display:"flex",gap:8,marginTop:8}}>
+                    <button style={{...sBtn,background:C.yellow,color:"#000",flex:1}} onClick={()=>commitPoint(ptWarning.pt)}>Save Anyway</button>
+                    <button style={{...sBtn,background:C.border,flex:1}} onClick={()=>setPtWarning(null)}>Cancel</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Points display */}
+          {pd.points.length>0&&(
+            <div style={sCard}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                <span style={{color:C.dim,fontSize:11,fontWeight:600}}>TRUING DATA — {pd.points.length} pts</span>
+                <button style={{...sBtnSm,background:confirmClear?C.red:C.border,padding:"4px 8px",fontSize:10}} onClick={clearAll}>{confirmClear?"TAP AGAIN":"Clear All"}</button>
+              </div>
+              {pd.points.map(p=>{
+                const conf = getConfZone(p.distance, parseFloat(rifle?.zeroDistance)||50);
+                return (
+                  <div key={p.id} style={{background:C.bg,borderRadius:6,padding:8,marginBottom:4}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                      <div style={{display:"flex",gap:8,alignItems:"baseline"}}>
+                        <span style={{color:C.text,fontWeight:700,fontSize:14}}>{p.distance}yd</span>
+                        <span style={{color:conf.color,fontWeight:600,fontSize:12}}>BC {p.bc.toFixed(4)}</span>
+                        <span style={{color:C.dim,fontSize:11}}>×{(p.factor||1).toFixed(3)}</span>
+                        {p.lowConf&&<span style={{color:C.yellow,fontSize:9,background:C.border,borderRadius:3,padding:"1px 4px"}}>LOW</span>}
+                      </div>
+                      <div style={{display:"flex",gap:6}}>
+                        <span style={{color:C.accent,cursor:"pointer",fontSize:10}} onClick={()=>{setEditPt(p.id);setNDist(p.distance.toString());setNDial(p.rawDial.toString());setNDialUnit(p.dialUnit||"MIL");setCollMode(false)}}>✎</span>
+                        <span style={{color:C.red,cursor:"pointer",fontSize:12}} onClick={()=>deletePt(p.id)}>✕</span>
+                      </div>
+                    </div>
+                    <div style={{display:"flex",gap:8,fontSize:10,color:C.dim,marginTop:2}}>
+                      <span>{p.rawDial}{p.dialUnit}</span>
+                      <span>{Math.round(p.velocity)}fps</span>
+                      <span>M{p.mach.toFixed(2)}</span>
+                      {p.conditions?.temp&&<span>{p.conditions.temp}°F</span>}
+                      {p.conditions?.da!==undefined&&<span>DA{p.conditions.da}</span>}
+                    </div>
+                  </div>
+                );
+              })}
+              {/* Single TM22 BC solver result */}
+              {pd.points.length>=2&&(()=>{
+                const sbr = solveSingleTM22Bc(pd.points);
+                if(!sbr) return null;
+                return (
+                  <div style={{background:"#0c2d1a",border:`1px solid ${C.green}`,borderRadius:6,padding:10,marginTop:8}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                      <span style={{color:C.green,fontSize:12,fontWeight:700}}>SINGLE TM22 BC</span>
+                      <span style={{color:C.text,fontSize:18,fontWeight:700}}>{sbr.bc.toFixed(4)}</span>
+                    </div>
+                    <div style={{display:"flex",justifyContent:"space-between",fontSize:11,color:C.dim}}>
+                      <span>{sbr.numPoints} points across {new Set(pd.points.map(p=>(p.conditions?.da||0).toString())).size} sessions</span>
+                      <span>avg ±{sbr.avgError.toFixed(2)} max ±{sbr.maxError.toFixed(2)} MIL</span>
+                    </div>
+                    {sbr.residuals&&sbr.residuals.length>0&&(
+                      <div style={{marginTop:6,fontSize:10}}>
+                        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:2,color:C.dim}}>
+                          <span style={{fontWeight:600}}>Dist</span><span style={{fontWeight:600,textAlign:"right"}}>Actual</span><span style={{fontWeight:600,textAlign:"right"}}>Pred</span><span style={{fontWeight:600,textAlign:"right"}}>Error</span>
+                          {sbr.residuals.map((r,i)=>(
+                            <React.Fragment key={i}>
+                              <span style={{color:C.text}}>{r.dist}yd</span>
+                              <span style={{textAlign:"right"}}>{r.actual.toFixed(2)}</span>
+                              <span style={{textAlign:"right"}}>{r.predicted.toFixed(2)}</span>
+                              <span style={{textAlign:"right",color:Math.abs(r.error)<0.1?C.green:Math.abs(r.error)<0.2?C.yellow:C.red}}>{(r.error>=0?"+":"")+r.error.toFixed(2)}</span>
+                            </React.Fragment>
+                          ))}
+                        </div>
+                        <div style={{marginTop:6,padding:"6px 8px",background:"rgba(0,0,0,0.3)",borderRadius:4,lineHeight:1.8}}>
+                          <div style={{color:C.dim,fontSize:9,fontWeight:600,marginBottom:2}}>LEGEND</div>
+                          <span style={{color:C.green,fontSize:9}}>■</span><span style={{color:C.dim,fontSize:9}}> Error &lt;0.1 MIL — excellent </span>
+                          <span style={{color:C.yellow,fontSize:9}}>■</span><span style={{color:C.dim,fontSize:9}}> 0.1–0.2 MIL — acceptable </span>
+                          <span style={{color:C.red,fontSize:9}}>■</span><span style={{color:C.dim,fontSize:9}}> &gt;0.2 MIL — check data</span><br/>
+                          <span style={{color:C.dim,fontSize:9}}>+ = predicted higher than actual (app over-predicts drop, dial less) </span><br/>
+                          <span style={{color:C.dim,fontSize:9}}>− = predicted lower than actual (app under-predicts drop, dial more)</span><br/>
+                          <span style={{color:C.dim,fontSize:9}}>BC = single value scaling the TM22 drag curve to fit all your field data</span><br/>
+                          <span style={{color:C.dim,fontSize:9}}>Sessions = unique conditions (temp/DA combos) detected in your data</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+              {/* TM22 curve display */}
+              {pd.points.length>=2&&(()=>{
+                const tbl = buildTM22Display(pd.points, baseBcN);
+                if(!tbl||tbl.length<2) return null;
+                const maxW = Math.max(...tbl.map(e=>e.weight));
+                return (
+                  <div style={{background:C.bg,borderRadius:6,padding:8,marginTop:8}}>
+                    <div style={{color:C.accent,fontSize:11,fontWeight:600,marginBottom:6}}>TM22 FACTOR CURVE — {tbl.length} zones</div>
+                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:2,fontSize:11}}>
+                      <span style={{color:C.dim,fontWeight:600}}>Mach</span>
+                      <span style={{color:C.dim,fontWeight:600,textAlign:"right"}}>Factor</span>
+                      <span style={{color:C.dim,fontWeight:600,textAlign:"right"}}>Eff BC</span>
+                      <span style={{color:C.dim,fontWeight:600,textAlign:"right"}}>Conf</span>
+                      {tbl.map((e,i)=>{
+                        const confPct = maxW > 0 ? Math.min((e.weight/maxW)*100, 100) : 50;
+                        const confClr = e.lowConf ? C.yellow : confPct > 60 ? C.green : confPct > 30 ? C.yellow : C.red;
+                        return (
+                          <React.Fragment key={i}>
+                            <span style={{color:C.text}}>{e.mach.toFixed(3)}</span>
+                            <span style={{color:Math.abs(e.factor-1)>0.15?C.yellow:C.green,textAlign:"right"}}>×{e.factor.toFixed(3)}</span>
+                            <span style={{color:C.dim,textAlign:"right"}}>{(baseBcN*e.factor).toFixed(4)}</span>
+                            <span style={{color:confClr,textAlign:"right"}}>{e.count>1?`${e.count}× `:""}{e.lowConf?"⚠":"●"}</span>
+                          </React.Fragment>
+                        );
+                      })}
+                    </div>
+                    <div style={{color:C.dim,fontSize:10,marginTop:4}}>Base BC {baseBcN} TM22 · ×1.0 = perfect match to reference curve</div>
+                    <div style={{marginTop:6,padding:"6px 8px",background:"rgba(0,0,0,0.3)",borderRadius:4,lineHeight:1.8}}>
+                      <div style={{color:C.dim,fontSize:9,fontWeight:600,marginBottom:2}}>LEGEND</div>
+                      <span style={{color:C.dim,fontSize:9}}><span style={{fontWeight:600}}>Mach</span> — bullet speed ÷ speed of sound at that point in flight</span><br/>
+                      <span style={{color:C.dim,fontSize:9}}><span style={{fontWeight:600}}>Factor</span> — how much the real drag differs from the reference curve at this Mach</span><br/>
+                      <span style={{color:C.dim,fontSize:9}}>&nbsp;&nbsp;</span><span style={{color:C.green,fontSize:9}}>×0.3–0.5</span><span style={{color:C.dim,fontSize:9}}> = normal for single BC fit &nbsp;</span>
+                      <span style={{color:C.yellow,fontSize:9}}>×&lt;0.2 or &gt;0.8</span><span style={{color:C.dim,fontSize:9}}> = unusual</span><br/>
+                      <span style={{color:C.dim,fontSize:9}}><span style={{fontWeight:600}}>Eff BC</span> — effective BC at this Mach (base BC × factor)</span><br/>
+                      <span style={{color:C.dim,fontSize:9}}><span style={{fontWeight:600}}>Conf</span> — confidence from data density at this Mach zone:</span><br/>
+                      <span style={{color:C.dim,fontSize:9}}>&nbsp;&nbsp;</span><span style={{color:C.green,fontSize:9}}>●</span><span style={{color:C.dim,fontSize:9}}> high confidence (many data points) &nbsp;</span>
+                      <span style={{color:C.yellow,fontSize:9}}>●</span><span style={{color:C.dim,fontSize:9}}> moderate &nbsp;</span>
+                      <span style={{color:C.red,fontSize:9}}>●</span><span style={{color:C.dim,fontSize:9}}> low (few points)</span><br/>
+                      <span style={{color:C.dim,fontSize:9}}>&nbsp;&nbsp;</span><span style={{color:C.yellow,fontSize:9}}>⚠</span><span style={{color:C.dim,fontSize:9}}> low-confidence zone (short range or clamped) — data is noisy here</span><br/>
+                      <span style={{color:C.dim,fontSize:9}}>&nbsp;&nbsp;<span style={{fontWeight:600}}>3×</span> = 3 data points in this Mach zone</span>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ============================================================================
+// HUD TAB — Match-day prediction display
+// ============================================================================
+function HudTab({ rifles, ammo, truingData, bleWeather, hudState, setHudState, windLog, setWindLog }) {
+  const hs = hudState;
+  const set = (k,v) => setHudState(prev=>({...prev,[k]:v}));
+  const [showWindLog, setShowWindLog] = useState(false);
+  const [wlActualDrift, setWlActualDrift] = useState("");
+  const [wlDriftDir, setWlDriftDir] = useState("R");
+  const [wlNote, setWlNote] = useState("");
+  const [wlMsg, setWlMsg] = useState("");
+
+  // Auto-populate from BLE weather when available
+  useEffect(() => {
+    if (bleWeather?.temp !== null && bleWeather?.temp !== undefined) {
+      set("temp", bleWeather.temp.toFixed(1));
+    }
+    if (bleWeather?.pressure !== null && bleWeather?.pressure !== undefined) {
+      // Compute DA from pressure and temp: DA = 145442.16 * (1 - (P/29.92126)^0.190255) adjusted for temp
+      const pInHg = bleWeather.pressure;
+      const tempF = bleWeather.temp || parseFloat(hs.temp) || 59;
+      const tempR = tempF + 459.67;
+      const stdTempR = 518.67;
+      const pressRatio = pInHg / 29.92126;
+      const da = 145442.16 * (1 - Math.pow(pressRatio * (stdTempR / tempR), 0.234969));
+      set("da", Math.round(da).toString());
+    }
+  }, [bleWeather]);
+
+  const rifle = rifles.find(r=>r.id===hs.rifleId);
+  const am = ammo.find(a=>a.id===hs.ammoId);
+  useEffect(()=>{if(!hs.rifleId&&rifles.length>0)set("rifleId",rifles[0].id);if(!hs.ammoId&&ammo.length>0)set("ammoId",ammo[0].id)},[rifles,ammo]);
+
+  const daVal = hs.da!==""&&!isNaN(parseFloat(hs.da))?parseFloat(hs.da):0;
+  const hasChrono = !!hs.mvOverride;
+  const mv = hasChrono?parseFloat(hs.mvOverride):(am?parseFloat(am.muzzleVelocity):1050);
+  const profileMV = am?parseFloat(am.muzzleVelocity):1050;
+  const estimatedMV = profileMV + (parseFloat(hs.temp) - 59) * 0.8;
+  const pk = hs.rifleId&&hs.ammoId?`${hs.rifleId}_${hs.ammoId}`:null;
+  const st = pk&&truingData[pk]?.points?.length>0?truingData[pk].points:null;
+  const baseBc = am?parseFloat(am.baseBc):0.135;
+  const isTrued = !!st;
+  const unit = rifle?.turretUnit||"MIL";
+  const isMOA = unit==="MOA";
+  const uLabel = isMOA?"MOA":"MIL";
+
+  // Solve single TM22 BC from all truing data (memoized)
+  const singleBcResult = useMemo(() => st ? solveSingleTM22Bc(st) : null, [st]);
+  const solverBc = singleBcResult ? singleBcResult.bc : baseBc;
+  const solverMode = singleBcResult ? "single" : "base";
+
+  const solve = useCallback((dist)=>{
+    if(!rifle||!am) return null;
+    const bc = singleBcResult ? singleBcResult.bc : baseBc;
+    const cdTable = TM22_TABLE;
+    // If user chrono'd today, MV already reflects actual temp — pass temp=59 to disable temp compensation
+    // If using profile MV, apply temp compensation normally
+    const solveTemp = hasChrono ? 59 : parseFloat(hs.temp);
+    return calculateDrop({distance:dist,muzzleVelocity:mv,bc,zeroRange:parseFloat(rifle.zeroDistance),scopeHeight:parseFloat(rifle.scopeHeight),temperature:solveTemp,densityAltitude:daVal}, cdTable);
+  },[rifle,am,mv,daVal,hs.temp,singleBcResult,baseBc,hasChrono]);
+
+  const rangeNum = parseInt(hs.range) || 0;
+  const res = useMemo(()=>rangeNum>0?solve(rangeNum):null,[solve,rangeNum]);
+  const elevRaw = res?(isMOA?res.dropMOA:res.dropMils):0;
+  const elevAbs = Math.abs(elevRaw);
+  const energy = res&&am?(parseFloat(am.bulletWeight)*res.velocity*res.velocity)/450437:0;
+  const conf = getConfZone(rangeNum, parseFloat(rifle?.zeroDistance||50));
+
+  // Wind
+  const w1 = parseFloat(hs.wind1Speed)||0, w2 = parseFloat(hs.wind2Speed)||0;
+  const isClock = hs.dirMode === "clock";
+  const toDeg = (v) => isClock ? parseClock(v) * 30 : (parseFloat(v) || 0);
+  const tBrg = toDeg(hs.targetBearing), wFrom = toDeg(hs.windFrom);
+  const cAngle = ((wFrom-tBrg)%360+360)%360;
+  const cFrac = Math.sin((cAngle*Math.PI)/180);
+  const wCalc = (spd)=>{
+    if(!res||spd<=0) return null;
+    const cFps=spd*cFrac*1.467;
+    const lag=res.tof-(rangeNum*3)/res.adjustedMV;
+    const dIn=cFps*lag;
+    return {dMils:(dIn/(rangeNum*36))*1000, dMOA:(dIn/rangeNum)*95.5};
+  };
+  const wd1=wCalc(w1), wd2=wCalc(w2);
+  const wv1=wd1?(isMOA?wd1.dMOA:wd1.dMils):0, wv2=wd2?(isMOA?wd2.dMOA:wd2.dMils):0;
+  const wDisp = wd2?(Math.abs(wv1)+Math.abs(wv2))/2:Math.abs(wv1);
+  const wDir = (wv1||wv2)>=0?"R":"L";
+
+  // Spin drift
+  const spinDrift = useMemo(()=>{
+    if(!res||!rifle) return null;
+    const twist = parseFloat(rifle.twistRate) || 16;
+    const twistDir = rifle.twistDir || "R";
+    const bw = am ? parseFloat(am.bulletWeight) || 40 : 40;
+    return calcSpinDriftAtDist(rangeNum, res.tof, twist, bw, twistDir);
+  },[res, rifle, am, rangeNum]);
+
+  // Total horizontal: spin drift + wind
+  const spinMils = spinDrift ? (isMOA ? spinDrift.driftMOA : spinDrift.driftMils) : 0;
+  const totalWindMils = wDisp + Math.abs(spinMils);
+  const spinDir = spinDrift && spinMils >= 0 ? "R" : "L";
+
+  const tMin=hs.tableMin||25, tMax=hs.tableMax||325, tStep=hs.tableStep||25;
+  const rTable = useMemo(()=>{
+    if(!rifle||!am) return [];
+    const rows=[];
+    for(let d=tMin;d<=tMax;d+=tStep){
+      const r=solve(d);
+      if(!r) continue;
+      const elev = isMOA?r.dropMOA:r.dropMils;
+      let wMin=0, wMax=0;
+      if((w1>0||w2>0) && cFrac!==0){
+        const calcW=(spd)=>{
+          if(spd<=0) return 0;
+          const cFps=spd*cFrac*1.467;
+          const lag=r.tof-(d*3)/r.adjustedMV;
+          const dIn=cFps*lag;
+          return isMOA?(dIn/d)*95.5:(dIn/(d*36))*1000;
+        };
+        wMin=calcW(w1); wMax=calcW(w2);
+      }
+      // Spin drift for table
+      let sd = 0;
+      if(rifle){
+        const twist = parseFloat(rifle.twistRate)||16;
+        const twistDir = rifle.twistDir||"R";
+        const bw = am?parseFloat(am.bulletWeight)||40:40;
+        const sdr = calcSpinDriftAtDist(d, r.tof, twist, bw, twistDir);
+        sd = isMOA?sdr.driftMOA:sdr.driftMils;
+      }
+      const z = getConfZone(d, parseFloat(rifle?.zeroDistance||50));
+      rows.push({d, elev, wMin, wMax, sd, confColor: z.color});
+    }
+    return rows;
+  },[solve,rifle,am,isMOA,tMin,tMax,tStep,w1,w2,cFrac]);
+
+  if(!rifles.length||!ammo.length) return <div style={{...sCard,textAlign:"center",color:C.dim,padding:40}}>Add a rifle and ammo in Profiles first.</div>;
+
+  return (
+    <div>
+      {/* Rifle/Ammo selector */}
+      <div style={{display:"flex",gap:6,marginBottom:10}}>
+        <div style={{flex:1}}><select style={{...sInput,fontSize:12}} value={hs.rifleId} onChange={e=>set("rifleId",e.target.value)}><option value="">Rifle...</option>{rifles.map(r=><option key={r.id} value={r.id}>{r.name}</option>)}</select></div>
+        <div style={{flex:1}}><select style={{...sInput,fontSize:12}} value={hs.ammoId} onChange={e=>set("ammoId",e.target.value)}><option value="">Ammo...</option>{ammo.map(a=><option key={a.id} value={a.id}>{a.profileName||`${a.manufacturer} ${a.name}`}</option>)}</select></div>
+        <div style={{background:isTrued?C.green:C.yellow,color:"#000",borderRadius:4,padding:"4px 8px",fontSize:10,fontWeight:700,display:"flex",alignItems:"center",whiteSpace:"nowrap"}}>{singleBcResult?`BC ${singleBcResult.bc.toFixed(3)} ±${singleBcResult.avgError.toFixed(2)}`:""}</div>
+      </div>
+
+      {/* Main display */}
+      <div style={{...sCard,padding:16}}>
+        <div style={{display:"flex"}}>
+          <div style={{flex:1,textAlign:"center",borderRight:`1px solid ${C.border}`}}>
+            <div style={{color:C.dim,fontSize:12,fontWeight:600,marginBottom:4}}>Elevation</div>
+            <div style={{color:C.text,fontSize:42,fontWeight:700,lineHeight:1}}>{res?elevAbs.toFixed(2):"—"}</div>
+            <div style={{color:C.dim,fontSize:11,marginTop:2}}>{uLabel}</div>
+            <div style={{color:C.blue,fontSize:16,marginTop:2,fontWeight:600}}>{res?(elevRaw>=0?"▲ UP":"▼ DN"):"—"}</div>
+          </div>
+          <div style={{flex:1,textAlign:"center"}}>
+            <div style={{color:C.dim,fontSize:12,fontWeight:600,marginBottom:4}}>Windage</div>
+            {wd2 ? (
+              <div style={{display:"flex",justifyContent:"center",gap:8,alignItems:"baseline"}}>
+                <div><div style={{color:C.text,fontSize:30,fontWeight:700,lineHeight:1}}>{Math.abs(wv1).toFixed(2)}</div><div style={{color:C.dim,fontSize:9}}>MIN</div></div>
+                <div style={{color:C.dim,fontSize:16}}>–</div>
+                <div><div style={{color:C.text,fontSize:30,fontWeight:700,lineHeight:1}}>{Math.abs(wv2).toFixed(2)}</div><div style={{color:C.dim,fontSize:9}}>MAX</div></div>
+              </div>
+            ) : (
+              <div style={{color:C.text,fontSize:42,fontWeight:700,lineHeight:1}}>{wDisp?wDisp.toFixed(2):"0.00"}</div>
+            )}
+            <div style={{color:C.dim,fontSize:11,marginTop:2}}>{uLabel}</div>
+            <div style={{color:C.blue,fontSize:14,marginTop:2,fontWeight:600}}>{wDisp>0?(wDir==="R"?"► R":"◄ L"):"—"}</div>
+          </div>
+        </div>
+        {/* Solver info */}
+        {singleBcResult && <div style={{marginTop:8,paddingTop:8,borderTop:`1px solid ${C.border}`,fontSize:11}}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+            <span style={{color:conf.color}}>● {conf.label}</span>
+            <span style={{color:C.dim}}>{conf.tip}</span>
+          </div>
+          <div style={{display:"flex",justifyContent:"space-between",color:C.dim}}>
+            <span>TM22 BC {singleBcResult.bc.toFixed(4)} from {singleBcResult.numPoints} pts</span>
+            <span>avg ±{singleBcResult.avgError.toFixed(2)} max ±{singleBcResult.maxError.toFixed(2)}</span>
+          </div>
+        </div>}
+        {/* Spin drift + cant info */}
+        {spinDrift && rangeNum > 50 && (
+          <div style={{marginTop:4,paddingTop:4,borderTop:`1px solid ${C.border}`,fontSize:10}}>
+            <div style={{display:"flex",justifyContent:"space-between",color:C.dim}}>
+              <span>Spin drift: <span style={{color:C.text,fontWeight:600}}>{Math.abs(isMOA?spinDrift.driftMOA:spinDrift.driftMils).toFixed(2)} {uLabel} {spinDir}</span></span>
+              <span>SG: {spinDrift.sg.toFixed(2)} · {spinDrift.driftInches>=0?"+":""}{spinDrift.driftInches.toFixed(2)}"</span>
+            </div>
+            {Math.abs(spinMils) > 0.05 && (
+              <div style={{color:C.yellow,fontSize:9,marginTop:2}}>
+                At {elevAbs.toFixed(1)} {uLabel} elev, 1° cant adds {Math.abs(calcCantEffect(elevAbs, 1).horizontalMils).toFixed(2)} {uLabel} horizontal shift
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Range selector */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:12,marginBottom:10}}>
+        <button style={{...sBtn,width:44,height:44,padding:0,fontSize:22,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>set("range",Math.max(tMin,rangeNum-tStep))}>−</button>
+        <div style={{textAlign:"center"}}>
+          <div style={{color:C.dim,fontSize:10,marginBottom:2}}>Range</div>
+          <input style={{...sInput,width:80,textAlign:"center",fontSize:18,fontWeight:700}} inputMode="numeric" value={hs.range===""?"":hs.range} onChange={e=>{const v=e.target.value;set("range",v===""?"":parseInt(v)||"")}} />
+          <div style={{color:C.dim,fontSize:10,marginTop:1}}>YD</div>
+        </div>
+        <button style={{...sBtn,width:44,height:44,padding:0,fontSize:22,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>set("range",Math.min(tMax,rangeNum+tStep))}>+</button>
+      </div>
+
+      {/* Flight data bar */}
+      <div style={{background:C.card,borderRadius:6,padding:"8px 12px",marginBottom:10,display:"flex",gap:16,fontSize:12,justifyContent:"center"}}>
+        <span><span style={{color:C.accent}}>{res?res.tof.toFixed(2):"—"}</span> <span style={{color:C.dim}}>s</span></span>
+        <span><span style={{color:C.accent}}>{energy?Math.round(energy):"—"}</span> <span style={{color:C.dim}}>ft·lb</span></span>
+        <span><span style={{color:C.accent}}>{res?Math.round(res.velocity):"—"}</span> <span style={{color:C.dim}}>fps</span></span>
+        <span><span style={{color:C.accent}}>{res?res.mach.toFixed(2):"—"}</span> <span style={{color:C.dim}}>M</span></span>
+      </div>
+
+      {/* Wind */}
+      <div style={{...sCard,padding:10}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+          <span style={{color:C.dim,fontSize:10,fontWeight:600}}>WIND</span>
+          <button style={{background:C.border,color:C.text,border:"none",borderRadius:4,padding:"3px 8px",fontSize:10,cursor:"pointer"}} onClick={()=>set("dirMode",isClock?"deg":"clock")}>{isClock?"Clock":"Degrees"}</button>
+        </div>
+        <div style={{display:"flex",gap:8,marginBottom:6}}>
+          <div style={{flex:1}}><label style={sLabel}>Target {isClock?"(clk)":"(°)"}</label><input style={sInput} inputMode={isClock?"text":"decimal"} value={hs.targetBearing} onChange={e=>set("targetBearing",e.target.value)} placeholder={isClock?"12:00":"0"} /></div>
+          <div style={{flex:1}}><label style={sLabel}>Wind FROM {isClock?"(clk)":"(°)"}</label><input style={sInput} inputMode={isClock?"text":"decimal"} value={hs.windFrom} onChange={e=>set("windFrom",e.target.value)} placeholder={isClock?"3:00":"90"} /></div>
+        </div>
+        <div style={{display:"flex",gap:8}}>
+          <div style={{flex:1}}><label style={sLabel}>Wind Min (mph)</label><input style={sInput} inputMode="decimal" value={hs.wind1Speed} onChange={e=>set("wind1Speed",e.target.value)} placeholder="0" /></div>
+          <div style={{flex:1}}><label style={sLabel}>Wind Max (mph)</label><input style={sInput} inputMode="decimal" value={hs.wind2Speed} onChange={e=>set("wind2Speed",e.target.value)} placeholder="0" /></div>
+        </div>
+        {(w1>0||w2>0)&&<div style={{color:C.dim,fontSize:10,marginTop:6}}>{Math.abs(cFrac)<0.17?"Head/Tail":Math.abs(cFrac)>0.94?"Full Cross":`${(Math.abs(cFrac)*100).toFixed(0)}% cross`} {cFrac>=0?"R":"L"}</div>}
+      </div>
+
+      {/* Environment */}
+      <div style={{...sCard,padding:0,overflow:"hidden"}}>
+        <div style={{display:"flex",justifyContent:"space-between",padding:"10px 12px",cursor:"pointer",borderBottom:hs.showEnv?`1px solid ${C.border}`:"none"}} onClick={()=>set("showEnv",!hs.showEnv)}>
+          <span style={{color:C.dim,fontSize:12,fontWeight:600}}>ENVIRONMENT {bleWeather?.source && <span style={{color:C.green,fontSize:10,fontWeight:700}}> ● {bleWeather.source}</span>}</span>
+          <span style={{color:C.dim}}>{hs.showEnv?"▲":"▼"}</span>
+        </div>
+        {hs.showEnv&&(
+          <div style={{padding:12}}>
+            <div style={{display:"flex",gap:8,marginBottom:8}}>
+              <div style={{flex:1}}>
+                <label style={sLabel}>Chrono'd MV (fps)</label>
+                <input style={{...sInput, borderColor: hasChrono ? C.green : C.border}} inputMode="decimal" value={hs.mvOverride} onChange={e=>set("mvOverride",e.target.value)} placeholder="—" />
+                <div style={{color:C.dim,fontSize:9,marginTop:2}}>{hasChrono?"Measured today — used directly":"Leave blank if no chrono"}</div>
+              </div>
+              <div style={{flex:1}}>
+                <label style={sLabel}>Estimated MV</label>
+                <div style={{...sInput, color: hasChrono ? C.dim : C.text, background: "transparent", border: `1px solid ${hasChrono ? "transparent" : C.border}`, padding: "8px 6px"}}>{estimatedMV.toFixed(0)} fps</div>
+                <div style={{color:C.dim,fontSize:9,marginTop:2}}>{profileMV} base {parseFloat(hs.temp)>=59?"+":""}{((parseFloat(hs.temp)-59)*0.8).toFixed(1)} temp</div>
+              </div>
+            </div>
+            <div style={{display:"flex",gap:8,marginBottom:8}}>
+              <div style={{flex:1}}><label style={sLabel}>Temp (°F){bleWeather?.temp!==null&&bleWeather?.temp!==undefined?" ●":""}</label><input style={sInput} inputMode="decimal" value={hs.temp} onChange={e=>set("temp",e.target.value)} /></div>
+              <div style={{flex:1}}><label style={sLabel}>DA (ft){bleWeather?.pressure!==null&&bleWeather?.pressure!==undefined?" ●":""}</label><input style={sInput} inputMode="numeric" value={hs.da} onChange={e=>set("da",e.target.value)} /></div>
+            </div>
+            {bleWeather?.windSpeed !== null && bleWeather?.windSpeed !== undefined && (
+              <div style={{color:C.green,fontSize:11,marginBottom:4}}>Wind: {bleWeather.windSpeed.toFixed(1)} mph @ {(bleWeather.windDir||0).toFixed(0)}°</div>
+            )}
+            <div style={{fontSize:10,marginTop:4,padding:"6px 8px",borderRadius:4,background:hasChrono?"rgba(34,197,94,0.1)":"rgba(234,179,8,0.1)"}}>
+              {hasChrono ? (
+                <span style={{color:C.green}}>✓ USING CHRONO: {hs.mvOverride} fps — no temp adjustment</span>
+              ) : (
+                <span style={{color:C.yellow}}>⚠ NO CHRONO: Est. {estimatedMV.toFixed(0)} fps — enter chrono'd MV for best accuracy</span>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Range Table */}
+      <div style={{...sCard,padding:0,overflow:"hidden",marginTop:10}}>
+        <div style={{display:"flex",justifyContent:"space-between",padding:"10px 12px",cursor:"pointer",borderBottom:hs.showTable?`1px solid ${C.border}`:"none"}} onClick={()=>set("showTable",!hs.showTable)}>
+          <span style={{color:C.dim,fontSize:12,fontWeight:600}}>RANGE TABLE ({uLabel})</span>
+          <span style={{color:C.dim}}>{hs.showTable?"▲":"▼"}</span>
+        </div>
+        {hs.showTable&&(
+          <div style={{padding:12}}>
+            <div style={{display:"flex",gap:8,marginBottom:10}}>
+              <div style={{flex:1}}><label style={sLabel}>Min</label><select style={sInput} value={tMin} onChange={e=>set("tableMin",parseInt(e.target.value))}>{[5,10,15,25,50,75,100].map(v=><option key={v} value={v}>{v}</option>)}</select></div>
+              <div style={{flex:1}}><label style={sLabel}>Max</label><select style={sInput} value={tMax} onChange={e=>set("tableMax",parseInt(e.target.value))}>{[100,150,200,250,300,325,400].map(v=><option key={v} value={v}>{v}</option>)}</select></div>
+              <div style={{flex:1}}><label style={sLabel}>Step</label><select style={sInput} value={tStep} onChange={e=>set("tableStep",parseInt(e.target.value))}>{[5,10,15,25,50].map(v=><option key={v} value={v}>{v}</option>)}</select></div>
+            </div>
+            {(()=>{
+              const hasWind = rTable.some(r=>r.wMin!==0||r.wMax!==0);
+              const hasBracket = rTable.some(r=>r.wMax!==0);
+              const hasSpin = rTable.some(r=>Math.abs(r.sd)>0.005);
+              const cols = 2 + (hasWind?1:0) + (hasBracket?1:0) + (hasSpin?1:0);
+              return (
+                <div style={{display:"grid",gridTemplateColumns:`repeat(${cols}, 1fr)`,gap:2,fontSize:12}}>
+                  <span style={{color:C.dim,fontWeight:600,paddingBottom:4}}>Dist</span>
+                  <span style={{color:C.dim,fontWeight:600,paddingBottom:4,textAlign:"right"}}>Elev</span>
+                  {hasSpin&&<span style={{color:C.dim,fontWeight:600,paddingBottom:4,textAlign:"right"}}>Spin</span>}
+                  {hasWind&&<span style={{color:C.dim,fontWeight:600,paddingBottom:4,textAlign:"right"}}>W Min</span>}
+                  {hasBracket&&<span style={{color:C.dim,fontWeight:600,paddingBottom:4,textAlign:"right"}}>W Max</span>}
+                  {rTable.map(r=>{
+                    const hl = r.d===rangeNum;
+                    const c = hl?C.accent:C.text;
+                    const fw = hl?700:400;
+                    return (
+                      <React.Fragment key={r.d}>
+                        <span style={{color:hl?C.accent:r.confColor,fontWeight:fw}}>{r.d}</span>
+                        <span style={{color:c,fontWeight:fw,textAlign:"right"}}>{r.elev>=0?"":"-"}{Math.abs(r.elev).toFixed(2)}</span>
+                        {hasSpin&&<span style={{color:hl?C.accent:C.dim,fontWeight:fw,textAlign:"right"}}>{Math.abs(r.sd).toFixed(2)}{r.sd>=0?"R":"L"}</span>}
+                        {hasWind&&<span style={{color:hl?C.accent:C.dim,fontWeight:fw,textAlign:"right"}}>{r.wMin?((r.wMin>=0?"":"-")+Math.abs(r.wMin).toFixed(2)):"—"}</span>}
+                        {hasBracket&&<span style={{color:hl?C.accent:C.dim,fontWeight:fw,textAlign:"right"}}>{r.wMax?((r.wMax>=0?"":"-")+Math.abs(r.wMax).toFixed(2)):"—"}</span>}
+                      </React.Fragment>
+                    );
+                  })}
+                </div>
+              );
+            })()}
+          </div>
+        )}
+      </div>
+
+      {/* Wind Log — capture actual drift observations */}
+      <div style={{...sCard,padding:0,overflow:"hidden",marginTop:10}}>
+        <div style={{display:"flex",justifyContent:"space-between",padding:"10px 12px",cursor:"pointer",borderBottom:showWindLog?`1px solid ${C.border}`:"none"}} onClick={()=>setShowWindLog(!showWindLog)}>
+          <span style={{color:C.dim,fontSize:12,fontWeight:600}}>WIND LOG {windLog.length>0&&<span style={{color:C.accent}}>({windLog.length})</span>}</span>
+          <span style={{color:C.dim}}>{showWindLog?"▲":"▼"}</span>
+        </div>
+        {showWindLog&&(
+          <div style={{padding:12}}>
+            <div style={{color:C.dim,fontSize:11,lineHeight:1.5,marginBottom:10,background:C.bg,borderRadius:6,padding:8}}>
+              <span style={{color:C.text,fontWeight:600}}>Log actual wind drift.</span> After dialing elevation, shoot without wind hold. Read the horizontal splash offset from your reticle. The app compares your actual vs its predicted drift to calibrate the wind model.
+            </div>
+
+            {/* Current conditions summary */}
+            {res && (w1>0||w2>0) && cFrac!==0 && (
+              <div style={{background:"rgba(59,130,246,0.1)",borderRadius:6,padding:8,marginBottom:10,border:`1px solid rgba(59,130,246,0.2)`}}>
+                <div style={{color:C.blue,fontSize:11,fontWeight:600,marginBottom:2}}>PREDICTED @ {rangeNum}yd</div>
+                <div style={{color:C.dim,fontSize:11}}>
+                  Wind: {w1}{w2>0?`–${w2}`:""} mph, crossing {Math.abs(cFrac*100).toFixed(0)}% → <span style={{color:C.text,fontWeight:600}}>{wDisp.toFixed(2)} {uLabel} {wDir}</span>
+                </div>
+              </div>
+            )}
+
+            {/* Entry form */}
+            <div style={{display:"flex",gap:6,marginBottom:8,alignItems:"flex-end"}}>
+              <div style={{flex:1}}>
+                <label style={sLabel}>Actual Drift ({uLabel})</label>
+                <input style={sInput} inputMode="decimal" value={wlActualDrift} onChange={e=>setWlActualDrift(e.target.value)} placeholder="0.00" />
+              </div>
+              <div style={{minWidth:55}}>
+                <label style={sLabel}>Dir</label>
+                <select style={{...sInput,padding:"8px 4px",fontSize:13}} value={wlDriftDir} onChange={e=>setWlDriftDir(e.target.value)}>
+                  <option value="R">► R</option>
+                  <option value="L">◄ L</option>
+                </select>
+              </div>
+            </div>
+            <div style={{marginBottom:8}}>
+              <label style={sLabel}>Note (optional)</label>
+              <input style={sInput} value={wlNote} onChange={e=>setWlNote(e.target.value)} placeholder="e.g. gusting, flags limp, mirage left" />
+            </div>
+            <button style={sBtn} onClick={()=>{
+              const drift = parseFloat(wlActualDrift);
+              if(isNaN(drift)){setWlMsg("Enter actual drift");return;}
+              if(!res){setWlMsg("Select distance first");return;}
+              const signedDrift = wlDriftDir==="L" ? -Math.abs(drift) : Math.abs(drift);
+              const predDrift = wDisp>0 ? (wDir==="L" ? -wDisp : wDisp) : 0;
+              const entry = {
+                id: Date.now().toString(),
+                timestamp: new Date().toISOString(),
+                distance: rangeNum,
+                windSpeed1: w1, windSpeed2: w2,
+                windFrom: hs.windFrom, targetBearing: hs.targetBearing,
+                dirMode: hs.dirMode,
+                crossingFrac: cFrac,
+                predictedDrift: predDrift,
+                actualDrift: signedDrift,
+                delta: signedDrift - predDrift,
+                unit: uLabel,
+                temp: parseFloat(hs.temp), da: parseFloat(hs.da),
+                mv: hasChrono ? parseFloat(hs.mvOverride) : estimatedMV,
+                bc: 0.0535,
+                tof: res.tof,
+                note: wlNote
+              };
+              setWindLog(prev=>[...prev, entry]);
+              setWlActualDrift("");setWlNote("");
+              setWlMsg(`Logged: ${rangeNum}yd ${Math.abs(drift).toFixed(2)} ${uLabel} ${wlDriftDir} (pred ${Math.abs(predDrift).toFixed(2)})`);
+              setTimeout(()=>setWlMsg(""),4000);
+            }}>+ Log Wind Observation</button>
+            {wlMsg&&<div style={{color:C.green,fontSize:11,marginTop:6}}>{wlMsg}</div>}
+
+            {/* Wind calibration summary */}
+            {windLog.length>=3&&(()=>{
+              const valid = windLog.filter(w=>Math.abs(w.predictedDrift)>0.05);
+              if(valid.length<2) return null;
+              const ratios = valid.map(w=>w.actualDrift/w.predictedDrift);
+              const avgRatio = ratios.reduce((s,r)=>s+r,0)/ratios.length;
+              const errors = valid.map(w=>Math.abs(w.actualDrift-w.predictedDrift));
+              const avgErr = errors.reduce((s,e)=>s+e,0)/errors.length;
+              const maxErr = Math.max(...errors);
+              return (
+                <div style={{background:"#0c2d1a",border:`1px solid ${C.green}`,borderRadius:6,padding:10,marginTop:10}}>
+                  <div style={{color:C.green,fontSize:12,fontWeight:700,marginBottom:4}}>WIND CALIBRATION</div>
+                  <div style={{color:C.dim,fontSize:11,lineHeight:1.6}}>
+                    <span style={{color:C.text,fontWeight:600}}>{valid.length} observations</span> with wind predictions<br/>
+                    Correction factor: <span style={{color:C.text,fontWeight:600}}>×{avgRatio.toFixed(2)}</span>
+                    {avgRatio>1.1?<span style={{color:C.yellow}}> — model under-predicts drift</span>:
+                     avgRatio<0.9?<span style={{color:C.yellow}}> — model over-predicts drift</span>:
+                     <span style={{color:C.green}}> — model is close</span>}<br/>
+                    Avg error: <span style={{color:avgErr<0.15?C.green:avgErr<0.3?C.yellow:C.red,fontWeight:600}}>±{avgErr.toFixed(2)} {uLabel}</span>
+                    {" "}max: ±{maxErr.toFixed(2)}
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Wind log entries */}
+            {windLog.length>0&&(
+              <div style={{marginTop:10}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                  <span style={{color:C.dim,fontSize:10,fontWeight:600}}>OBSERVATIONS ({windLog.length})</span>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"auto 1fr 1fr 1fr auto",gap:2,fontSize:10}}>
+                  <span style={{color:C.dim,fontWeight:600}}>Dist</span>
+                  <span style={{color:C.dim,fontWeight:600,textAlign:"right"}}>Pred</span>
+                  <span style={{color:C.dim,fontWeight:600,textAlign:"right"}}>Actual</span>
+                  <span style={{color:C.dim,fontWeight:600,textAlign:"right"}}>Delta</span>
+                  <span></span>
+                  {[...windLog].reverse().slice(0,20).map(w=>(
+                    <React.Fragment key={w.id}>
+                      <span style={{color:C.text}}>{w.distance}yd</span>
+                      <span style={{color:C.dim,textAlign:"right"}}>{w.predictedDrift>=0?"+":""}{w.predictedDrift.toFixed(2)}</span>
+                      <span style={{color:C.text,textAlign:"right"}}>{w.actualDrift>=0?"+":""}{w.actualDrift.toFixed(2)}</span>
+                      <span style={{color:Math.abs(w.delta)<0.1?C.green:Math.abs(w.delta)<0.2?C.yellow:C.red,textAlign:"right"}}>{w.delta>=0?"+":""}{w.delta.toFixed(2)}</span>
+                      <span style={{color:C.red,cursor:"pointer",textAlign:"center"}} onClick={()=>setWindLog(prev=>prev.filter(x=>x.id!==w.id))}>✕</span>
+                    </React.Fragment>
+                  ))}
+                </div>
+                <div style={{marginTop:4,padding:"4px 6px",background:"rgba(0,0,0,0.3)",borderRadius:4,fontSize:9,color:C.dim,lineHeight:1.6}}>
+                  Pred = model prediction · Actual = observed splash · Delta = actual − pred (+ = more drift than model)
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// GUIDE TAB
+// ============================================================================
+function GuideTab() {
+  const [section, setSection] = useState("truing");
+  const sections = [
+    { id: "truing", label: "Truing" },
+    { id: "matchday", label: "Match Day" },
+    { id: "theory", label: "Why" },
+  ];
+  const hdr = { color: C.accent, fontSize: 15, fontWeight: 700, marginTop: 16, marginBottom: 6 };
+  const sub = { color: C.text, fontSize: 14, fontWeight: 600, marginTop: 14, marginBottom: 4 };
+  const p = { color: C.dim, fontSize: 13, lineHeight: 1.5, marginBottom: 8 };
+  const li = { color: C.dim, fontSize: 13, lineHeight: 1.6, marginBottom: 4, paddingLeft: 8 };
+  const num = { color: C.accent, fontWeight: 700, marginRight: 4 };
+  const em = { color: C.text, fontWeight: 600 };
+  const warn = { color: C.yellow, fontWeight: 600 };
+  const good = { color: C.green, fontWeight: 600 };
+  const divider = { borderTop: `1px solid ${C.border}`, margin: "14px 0" };
+  const badge = (color, text) => ({ display: "inline-block", background: color, color: "#fff", fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4, marginRight: 6, verticalAlign: "middle" });
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+        {sections.map(s => (
+          <button key={s.id} onClick={() => setSection(s.id)} style={{
+            ...sBtnSm,
+            background: section === s.id ? C.accent : C.card,
+            border: section === s.id ? "none" : `1px solid ${C.border}`,
+            flex: 1, textAlign: "center"
+          }}>{s.label}</button>
+        ))}
+      </div>
+
+      {section === "truing" && (
+        <div>
+          <div style={sCard}>
+            <div style={hdr}>Before the Range</div>
+            <div style={li}><span style={num}>1.</span> <span style={em}>Profiles tab</span> → create rifle (scope height, zero distance) and ammo (manufacturer, product, lot number).</div>
+            <div style={li}><span style={num}>2.</span> <span style={{...em,color:C.green}}>ALWAYS chrono on the day.</span> 10 rounds minimum, record the mean. Enter it in the Truing tab's Chrono MV field. The app uses your chrono'd MV directly — no temp adjustment applied.</div>
+            <div style={li}><span style={num}>3.</span> Run a <span style={em}>Tall Target Test</span> if scope tracking is unverified. Truing tab → Scope Tracking section.</div>
+            <div style={li}><span style={num}>4.</span> Pick <span style={em}>one chronograph</span> and use it exclusively. Mixing chronos contaminates your MV baseline.</div>
+          </div>
+
+          <div style={sCard}>
+            <div style={hdr}>At the Range — Truing Session</div>
+            <div style={p}>The app solves a <span style={em}>single TM22 BC</span> from all your truing data across all sessions. Every point you add improves the BC estimate. Focus on 175yd+ for the best solver accuracy.</div>
+
+            <div style={sub}>Step 1: Setup</div>
+            <div style={li}><span style={num}>•</span> <span style={{...em,color:C.green}}>Chrono first</span> — 10 rounds, enter mean in Chrono MV field.</div>
+            <div style={li}><span style={num}>•</span> Record <span style={em}>temperature</span> and <span style={em}>density altitude</span> from Kestrel or weather app.</div>
+            <div style={li}><span style={num}>•</span> Enter temp and DA into the Truing tab's Session Conditions.</div>
+
+            <div style={sub}>Step 2: Zero (5 rounds)</div>
+            <div style={li}><span style={num}>•</span> Confirm zero at 50yd. Adjust if needed.</div>
+
+            <div style={sub}>Step 3: Shoot the Ladder</div>
+            <div style={p}>Use <span style={em}>Collection Mode</span> for fast entry. Shoot 3 groups per distance, 5 rounds each, enter the average dial-up.</div>
+            <div style={{display:"grid",gridTemplateColumns:"auto auto auto",gap:"2px 10px",fontSize:12,color:C.dim,paddingTop:4,marginBottom:8}}>
+              <span style={em}>Distance</span><span style={em}>Priority</span><span style={em}>Why</span>
+              <span style={{color:C.dim}}>100–125yd</span><span style={{color:C.yellow}}>Optional</span><span>Low solver value — BC insensitive here</span>
+              <span style={{color:C.text}}>175yd</span><span style={{color:C.green}}>High</span><span>Entering sweet spot for BC solving</span>
+              <span style={{color:C.text}}>200yd</span><span style={{color:C.green}}>High</span><span>Core truing distance</span>
+              <span style={{color:C.text}}>225yd</span><span style={{color:C.green}}>High</span><span>Core truing distance</span>
+              <span style={{color:C.text}}>250yd</span><span style={{color:C.green}}>High</span><span>Strong BC signal</span>
+              <span style={{color:C.text}}>275yd</span><span style={{color:C.blue}}>Good</span><span>Extends validated range</span>
+              <span style={{color:C.text}}>302yd</span><span style={{color:C.blue}}>Good</span><span>Max competition distance</span>
+            </div>
+            <div style={li}><span style={{...num, color: C.blue}}>APP:</span> Enter each distance + dial-up → Save. The app validates each point against the current BC and warns if something looks wrong.</div>
+            <div style={li}><span style={{...num, color: C.yellow}}>KESTREL:</span> Compare SHORT profile (&lt;150yd) and LONG profile (&gt;150yd) against actual. Adjust G7/G1 BC as needed.</div>
+
+            <div style={divider} />
+            <div style={p}><span style={good}>✓ Minimum session:</span> Chrono + Zero + 200yd + 250yd = 30 rounds.</div>
+            <div style={p}><span style={good}>✓ Better session:</span> Add 175 + 225 + 275 = 55 rounds.</div>
+            <div style={p}><span style={good}>✓ Full session:</span> Add 302yd = 65 rounds. Per rifle.</div>
+            <div style={p}><span style={em}>More sessions = tighter BC.</span> Three sessions across different conditions got avg ±0.14 MIL. Five sessions should reach ±0.10.</div>
+          </div>
+
+          <div style={sCard}>
+            <div style={hdr}>Kestrel — Two Optimized Profiles</div>
+
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginTop:10}}>
+              <div style={{background:C.bg,borderRadius:6,padding:10,border:`1px solid ${C.border}`}}>
+                <div style={{color:C.yellow,fontSize:13,fontWeight:700,marginBottom:6}}>SHORT (50–150yd)</div>
+                <div style={{color:C.dim,fontSize:12,lineHeight:1.6}}>
+                  Drag: <span style={em}>G7</span><br/>
+                  BC: <span style={em}>~0.078</span> (true at 125yd)<br/>
+                  MV: <span style={em}>Your real chrono</span>
+                </div>
+              </div>
+              <div style={{background:C.bg,borderRadius:6,padding:10,border:`1px solid ${C.border}`}}>
+                <div style={{color:C.blue,fontSize:13,fontWeight:700,marginBottom:6}}>LONG (150–300yd)</div>
+                <div style={{color:C.dim,fontSize:12,lineHeight:1.6}}>
+                  Drag: <span style={em}>G1</span><br/>
+                  BC: <span style={em}>~0.50–0.55</span> (true at 225yd)<br/>
+                  MV: <span style={em}>Same real chrono</span>
+                </div>
+              </div>
+            </div>
+
+            <div style={{...p,marginTop:10}}><span style={warn}>⚠ Never adjust MV to make predictions fit.</span> MV is measured. BC is the only tuning knob on the Kestrel. If the prediction won't match with any reasonable BC, check your zero and scope tracking first.</div>
+          </div>
+
+          <div style={sCard}>
+            <div style={hdr}>Key Rules</div>
+            <div style={li}>⚡ <span style={em}>MV and scope height are facts.</span> Measure them, lock them, never touch them to "make the numbers work."</div>
+            <div style={li}>⚡ <span style={em}>BC is a tuning knob</span> — in the app AND the Kestrel. The solver adjusts it. You don't pick it from a chart.</div>
+            <div style={li}>⚡ <span style={{...em,color:C.green}}>Chrono'd MV = no temp adjustment.</span> The app detects when you've entered a chrono'd value and uses it directly. If no chrono, it estimates from profile + temp.</div>
+            <div style={li}>⚡ <span style={em}>Skip ≤125yd for truing.</span> Short-range physics is too insensitive to extract a reliable BC. Your short-range hits won't be affected — BC barely matters under 125yd.</div>
+            <div style={li}>⚡ <span style={em}>Cold barrel first.</span> If shooting 250+ yards, shoot it early before barrel heats up.</div>
+            <div style={li}>⚡ <span style={em}>Data validation:</span> The app checks every point before saving. If it warns you, double-check your reading before confirming.</div>
+            <div style={li}>⚡ <span style={em}>More sessions beats better math.</span> Each session under different conditions tightens the BC estimate. Don't clear old data — it all helps.</div>
+          </div>
+
+          <div style={sCard}>
+            <div style={hdr}>Re-Truing Rules</div>
+
+            <div style={{background:"rgba(59,130,246,0.1)",borderRadius:6,padding:10,marginTop:8,marginBottom:10,border:`1px solid rgba(59,130,246,0.2)`}}>
+              <div style={{color:C.blue,fontSize:13,fontWeight:700,marginBottom:4}}>App — Almost Never Needs Re-Truing</div>
+              <div style={{color:C.dim,fontSize:12,lineHeight:1.5}}>TM22 is Mach-indexed. When you update temp and DA in the HUD, the solver recalculates air density, speed of sound, and Mach at every distance automatically. The Cd(Mach) table follows the physics — no re-true needed for atmospheric changes. Just update the HUD.</div>
+            </div>
+            <div style={li}><span style={em}>App re-true only for physical changes:</span></div>
+            <div style={li}><span style={num}>•</span> New ammo lot → re-chrono MV, re-true (the bullet changed)</div>
+            <div style={li}><span style={num}>•</span> New scope mount or scope height change → update profile, re-true</div>
+            <div style={li}><span style={num}>•</span> Significant barrel wear (thousands of rounds) → re-chrono MV</div>
+
+            <div style={{background:"rgba(234,179,8,0.1)",borderRadius:6,padding:10,marginTop:12,marginBottom:10,border:`1px solid rgba(234,179,8,0.2)`}}>
+              <div style={{color:C.yellow,fontSize:13,fontWeight:700,marginBottom:4}}>Kestrel — Needs Re-Truing for Weather Changes</div>
+              <div style={{color:C.dim,fontSize:12,lineHeight:1.5}}>G1/G7 BC was trued at a specific Mach that existed at a specific distance on truing day. Different DA → different Mach at that distance → G1/G7 error changes → trued BC is wrong. The Kestrel can't auto-correct for this.</div>
+            </div>
+            <div style={li}><span style={em}>Kestrel re-true triggers:</span></div>
+            <div style={li}><span style={num}>•</span> DA shifts <span style={em}>&gt;2000ft</span> from truing day</div>
+            <div style={li}><span style={num}>•</span> Temperature changes <span style={em}>&gt;30°F</span> from truing day</div>
+            <div style={li}><span style={num}>•</span> New ammo lot → re-chrono MV, re-true at both distances</div>
+            <div style={li}><span style={num}>•</span> Below those thresholds → Kestrel scales well enough for competition</div>
+
+            <div style={{...p,marginTop:10}}><span style={good}>This is TM22's core advantage.</span> The app handles condition changes automatically. The Kestrel can't. Over a season with 40°F temperature swings and 3000ft DA variation, the app stays accurate while the Kestrel drifts 0.1–0.2 MIL at 250–300yd without re-truing.</div>
+          </div>
+        </div>
+      )}
+
+      {section === "matchday" && (
+        <div>
+          <div style={sCard}>
+            <div style={hdr}>Pre-Match Checklist</div>
+            <div style={li}><span style={num}>1.</span> Turn on Kestrel. Note <span style={em}>temp</span> and <span style={em}>DA</span>.</div>
+            <div style={li}><span style={num}>2.</span> Enter temp and DA into app HUD.</div>
+            <div style={li}><span style={num}>3.</span> <span style={{...em,color:C.green}}>If you chrono'd today:</span> enter MV in HUD's Chrono MV field. The app uses it directly — no temp adjustment.</div>
+            <div style={li}><span style={num}>4.</span> <span style={{...em,color:C.yellow}}>If you didn't chrono:</span> leave Chrono MV blank. The app estimates MV from your profile baseline + temp adjustment.</div>
+            <div style={li}><span style={num}>5.</span> Confirm zero at 50yd (5 rounds).</div>
+            <div style={li}><span style={num}>6.</span> Kestrel: verify SHORT and LONG profiles have current MV.</div>
+          </div>
+
+          <div style={sCard}>
+            <div style={hdr}>Stage Workflow</div>
+            <div style={li}><span style={num}>1.</span> Get target distance from stage brief.</div>
+            <div style={li}><span style={num}>2.</span> Enter distance in app → read elevation.</div>
+            <div style={li}><span style={num}>3.</span> Cross-check Kestrel (SHORT or LONG depending on range).</div>
+            <div style={li}><span style={num}>4.</span> Dial → send.</div>
+
+            <div style={sub}>DA Update Rule</div>
+            <div style={p}>Glance at Kestrel between stages. Update app if DA has shifted:</div>
+            <div style={{display:"grid",gridTemplateColumns:"auto 1fr",gap:"4px 12px",paddingLeft:8,fontSize:13,color:C.dim}}>
+              <span style={em}>Below 150yd:</span><span>Don't bother</span>
+              <span style={em}>150–225yd:</span><span>Update if DA shifted &gt;500ft</span>
+              <span style={em}>225–300yd:</span><span>Update if DA shifted &gt;300ft</span>
+            </div>
+          </div>
+
+          <div style={sCard}>
+            <div style={hdr}>When to Trust What</div>
+            <div style={{borderRadius:6,overflow:"hidden",marginTop:8}}>
+              <div style={{display:"flex",alignItems:"center",padding:"8px 10px",background:"rgba(34,197,94,0.1)",borderBottom:`1px solid ${C.border}`}}>
+                <span style={{color:C.green,fontWeight:700,fontSize:13,minWidth:100}}>Below 150yd</span>
+                <span style={{color:C.dim,fontSize:13}}>Trust <span style={{...em,color:C.yellow}}>Kestrel SHORT</span> — validated at matches, G7 error is minimal here</span>
+              </div>
+              <div style={{display:"flex",alignItems:"center",padding:"8px 10px",background:"rgba(34,197,94,0.1)",borderBottom:`1px solid ${C.border}`}}>
+                <span style={{color:C.green,fontWeight:700,fontSize:13,minWidth:100}}>150–275yd</span>
+                <span style={{color:C.dim,fontSize:13}}>Trust <span style={{...em,color:C.blue}}>the app</span> — TM22 cross-condition accuracy ±0.03–0.14 MIL</span>
+              </div>
+              <div style={{display:"flex",alignItems:"center",padding:"8px 10px",background:"rgba(234,179,8,0.1)",borderBottom:`1px solid ${C.border}`}}>
+                <span style={{color:C.yellow,fontWeight:700,fontSize:13,minWidth:100}}>Above 275yd</span>
+                <span style={{color:C.dim,fontSize:13}}>Average <span style={{...em,color:C.blue}}>app</span> + <span style={{...em,color:C.yellow}}>Kestrel LONG</span>, lean toward app</span>
+              </div>
+              <div style={{display:"flex",alignItems:"center",padding:"8px 10px",background:"rgba(239,68,68,0.1)"}}>
+                <span style={{color:C.red,fontWeight:700,fontSize:13,minWidth:100}}>Disagree &gt;0.3</span>
+                <span style={{color:C.dim,fontSize:13}}>Re-check zero, re-check DA entry, re-check MV</span>
+              </div>
+            </div>
+          </div>
+
+          <div style={sCard}>
+            <div style={hdr}>Kestrel's Real Match Value</div>
+            <div style={p}><span style={em}>Live weather and wind.</span> The atmospheric density model is independent of drag curve shape — Kestrel computes air density correctly regardless of whether its ballistic solver is wrong for 22LR. Use it for atmospherics. Use the app for elevation predictions. This gives you the best of both.</div>
+          </div>
+
+          <div style={sCard}>
+            <div style={sub}>Quick Ref — Pre-Match Truing (Per Rifle)</div>
+            <div style={{display:"grid",gridTemplateColumns:"auto auto auto",gap:"2px 10px",fontSize:12,color:C.dim,paddingTop:6}}>
+              <span style={em}>Distance</span><span style={em}>Rounds</span><span style={em}>Purpose</span>
+              <span style={{color:C.green}}>Chrono</span><span>10</span><span style={{color:C.green}}>CRITICAL — enter in Chrono MV</span>
+              <span>50yd zero</span><span>5</span><span>Confirm zero</span>
+              <span>200yd</span><span>10–15</span><span>Core truing — app + Kestrel LONG</span>
+              <span>250yd</span><span>10–15</span><span>Strong BC signal</span>
+              <span style={{color:C.dim,fontStyle:"italic"}}>175yd</span><span style={{fontStyle:"italic"}}>10</span><span style={{fontStyle:"italic"}}>Extra solver data (if time)</span>
+              <span style={{color:C.dim,fontStyle:"italic"}}>225yd</span><span style={{fontStyle:"italic"}}>10</span><span style={{fontStyle:"italic"}}>Kestrel LONG fine-tune (if time)</span>
+              <span style={{color:C.dim,fontStyle:"italic"}}>275–302yd</span><span style={{fontStyle:"italic"}}>10</span><span style={{fontStyle:"italic"}}>Extends validated range (if time)</span>
+            </div>
+            <div style={{...p,marginTop:8}}>Minimum: <span style={em}>40 rounds</span>. Full: <span style={em}>75 rounds</span>. × 2 rifles for CZD + CZT.</div>
+          </div>
+        </div>
+      )}
+
+      {section === "theory" && (
+        <div>
+          <div style={sCard}>
+            <div style={hdr}>Why Two Kestrel Profiles?</div>
+            <div style={p}>22LR bullets spend their entire flight in the transonic zone (Mach 0.85–0.95 at the muzzle, dropping to Mach 0.65–0.75 at 300yd). Neither G1 nor G7 models this zone correctly, but they're wrong in different ways:</div>
+            <div style={li}><span style={{...em,color:C.yellow}}>G7</span> has a flatter error shape in the high-Mach zone (Mach 0.85–0.95). A single BC absorbs this error well at <span style={em}>short range</span> where the bullet is still fast.</div>
+            <div style={li}><span style={{...em,color:C.blue}}>G1</span> becomes progressively less wrong as the bullet decelerates into deep subsonic past 200yd. A BC trued at 225yd works well for <span style={em}>long range</span> where G1's error curve is gentle.</div>
+            <div style={p}>One BC on either model can't cover 50–300yd because the error shape changes across the Mach range. Two profiles — G7 short, G1 long — uses each model where it's least wrong.</div>
+          </div>
+
+          <div style={sCard}>
+            <div style={hdr}>Why the App Is Better</div>
+            <div style={p}>The TM22 engine indexes drag corrections by <span style={em}>Mach number</span>, not distance. This matters because the same distance produces different Mach numbers on different days:</div>
+            <div style={li}><span style={num}>•</span> Cold day (DA −1000): peak drag correction at ~163yd</div>
+            <div style={li}><span style={num}>•</span> Standard day (DA 0): peak at ~185yd</div>
+            <div style={li}><span style={num}>•</span> Hot/altitude (DA +3000): peak at ~218yd</div>
+            <div style={p}>That's a <span style={em}>55-yard swing</span> in where the peak correction applies. The Kestrel's G1/G7 BC was trued at a specific distance on a specific day — it applies the correction at the wrong place when conditions change. TM22 follows the Mach, not the distance, so the correction is always in the right place.</div>
+          </div>
+
+          <div style={sCard}>
+            <div style={hdr}>Why Kestrel Scaling Has Limits</div>
+            <div style={p}>When you trued G1 BC at 225yd, you found the BC that works at <span style={em}>that day's terminal Mach at 225yd</span>. On a different day:</div>
+            <div style={li}><span style={num}>•</span> Terminal Mach at 225yd shifts ~±0.010 per ±1500ft DA change</div>
+            <div style={li}><span style={num}>•</span> G1's error at the new Mach is slightly different → trued BC slightly wrong</div>
+            <div style={li}><span style={num}>•</span> Effect: <span style={em}>0.1–0.2 MIL at 250–300yd</span> for typical seasonal variation</div>
+            <div style={p}>This is competitive but not perfect. Below 225yd, the effect is negligible. Above 275yd, it matters. The app eliminates this entirely — Mach-indexed corrections auto-track.</div>
+          </div>
+
+          <div style={sCard}>
+            <div style={hdr}>What TM22 Actually Is</div>
+            <div style={p}>A drag coefficient table measured by Applied Ballistics' Doppler radar for SK Match ammunition, polynomial-smoothed to remove lab noise, validated across three field sessions spanning 1335ft of DA variation.</div>
+            <div style={li}><span style={num}>•</span> <span style={em}>59 Cd points</span> spanning Mach 0.625–0.875 (85% of the flight envelope)</div>
+            <div style={li}><span style={num}>•</span> <span style={em}>Single BC solver</span> fits one BC value across ALL truing points from ALL sessions simultaneously</div>
+            <div style={li}><span style={num}>•</span> Each point evaluated under its own recorded conditions (temp, DA, MV) — the solver sees the physics correctly</div>
+            <div style={li}><span style={num}>•</span> Solver noise reduced <span style={em}>77%</span> vs G1 — physically reasonable BCs instead of inflated guesses</div>
+            <div style={li}><span style={num}>•</span> Current accuracy: <span style={em}>avg ±0.14 MIL, max ±0.30</span> across 18 points, 3 sessions</div>
+            <div style={li}><span style={num}>•</span> SK, Eley, Norma, and Lapua match ammo all share this drag profile within 1%</div>
+          </div>
+
+          <div style={sCard}>
+            <div style={hdr}>Cross-Condition Validation (Sessions 2→3)</div>
+            <div style={p}>Model trued on Session 2 data predicted Session 3 dial-ups (different day, different temp, different DA):</div>
+            <div style={{display:"grid",gridTemplateColumns:"auto auto auto auto",gap:"2px 10px",fontSize:12,color:C.dim,paddingTop:4}}>
+              <span style={em}>Dist</span><span style={em}>Actual</span><span style={em}>Predicted</span><span style={em}>Delta</span>
+              <span>100yd</span><span>1.80</span><span>1.86</span><span style={{color:C.green}}>+0.06 ✓</span>
+              <span>175yd</span><span>5.60</span><span>5.63</span><span style={{color:C.green}}>+0.03 ✓</span>
+              <span>192yd</span><span>6.60</span><span>6.69</span><span style={{color:C.green}}>+0.09 ✓</span>
+              <span>225yd</span><span>8.70</span><span>8.84</span><span style={{color:C.green}}>+0.14 ✓</span>
+              <span>302yd</span><span>14.00</span><span>14.21</span><span style={{color:C.yellow}}>+0.21</span>
+            </div>
+            <div style={{...p,marginTop:8}}>Mid-range (150–225yd): <span style={good}>±0.03–0.14 MIL.</span> That's inside one click on most scopes. The model works across conditions.</div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================================
+// DEV TAB — Development notes, bug tracking, feature requests
+// ============================================================================
+function DevTab({ devNotes, setDevNotes }) {
+  const [noteText, setNoteText] = useState("");
+  const [noteTag, setNoteTag] = useState("bug");
+  const tags = [
+    { id: "bug", label: "🐛 Bug", color: C.red },
+    { id: "feature", label: "💡 Feature", color: C.blue },
+    { id: "improve", label: "⚡ Improve", color: C.yellow },
+    { id: "note", label: "📝 Note", color: C.dim },
+  ];
+  const tagInfo = (id) => tags.find(t => t.id === id) || tags[3];
+
+  const addNote = () => {
+    if (!noteText.trim()) return;
+    setDevNotes(prev => [{
+      id: Date.now().toString(),
+      timestamp: new Date().toISOString(),
+      tag: noteTag,
+      text: noteText.trim(),
+      status: "open"
+    }, ...prev]);
+    setNoteText("");
+  };
+
+  const toggleStatus = (id) => {
+    setDevNotes(prev => prev.map(n => n.id === id ? { ...n, status: n.status === "open" ? "done" : "open" } : n));
+  };
+
+  const deleteNote = (id) => {
+    setDevNotes(prev => prev.filter(n => n.id !== id));
+  };
+
+  const [filter, setFilter] = useState("all");
+  const filtered = filter === "all" ? devNotes : filter === "open" ? devNotes.filter(n => n.status === "open") : devNotes.filter(n => n.tag === filter);
+
+  const roadmap = [
+    // NEXT — actively building
+    { status: "next", label: "Horizontal offset logging in truing (spin drift + cant baseline)" },
+    { status: "next", label: "Spin drift diagnostic alert — offset exceeds physics, check cant/mount" },
+    { status: "next", label: "Wind model shooter adaptation — correction factor improves as wind calls improve" },
+    { status: "next", label: "Stage log — quick hit/miss entry between stages for post-match analysis" },
+    // COMPLETED
+    { status: "done", label: "TM22 reference curve engine (59 Cd points, Mach 0.625–0.875)" },
+    { status: "done", label: "Single BC solver (replaces stepped BC)" },
+    { status: "done", label: "Chrono MV bypass (no double temp comp)" },
+    { status: "done", label: "ISA power law air density" },
+    { status: "done", label: "Data validation gate (clamped BC, factor, prediction delta)" },
+    { status: "done", label: "Truing tab persistence across tabs/restarts" },
+    { status: "done", label: "Scope tracking tool with tall target instructions" },
+    { status: "done", label: "Wind log + calibration factor" },
+    { status: "done", label: "Legends for BC stats and factor curve" },
+    { status: "done", label: "Number keyboard on all numeric fields" },
+    { status: "done", label: "MV labels clarified in HUD and Truing" },
+    { status: "done", label: "Dev tab with notes, roadmap, build stats" },
+    { status: "done", label: "Spin drift calculation (Miller formula) in HUD + range table" },
+    { status: "done", label: "Scope cant effect warning at current elevation" },
+    { status: "done", label: "Twist direction in rifle profile (R/L)" },
+    // FUTURE — SOFTWARE
+    { status: "future", label: "Settings page — app-wide units, spin drift on/off, HUD view mode, display preferences" },
+    { status: "future", label: "Tools/Converters tab — MIL↔MOA, MIL↔inches@dist, angular↔linear, enter 2 solve 3rd" },
+    { status: "future", label: "Tools: Velocity converter (fps/mps), temp converter, pressure/altitude converter" },
+    { status: "future", label: "Tools: Cosine indicator — angle shot correction" },
+    { status: "future", label: "Tools: Coriolis/Eötvös calculator — reference tool now, add to solver when app expands to centerfire" },
+    { status: "future", label: "Tools: MildotRanger — camera-based ranging from known target size in reticle" },
+    { status: "future", label: "Tools: Moving target lead calculator — hold-off for movers at speed" },
+    { status: "future", label: "Tools: Powder temp MV table — 5-point measured curve (replaces fixed 0.8 fps/°F)" },
+    { status: "future", label: "Reticle library in rifle profile — 1,895 reticles, 64 brands, FFP/SFP setting" },
+    { status: "future", label: "HUD reticle view mode — toggle Numbers vs Reticle overlay with target behind" },
+    { status: "future", label: "Virtual target viewer — FFP/SFP scaling, NRL22 target table built in" },
+    { status: "future", label: "Zero atmosphere storage — track conditions at zero separately from current" },
+    { status: "future", label: "Camera group analysis — POA→POI precision to 0.01 MIL (Range Buddy ref extracted)" },
+    { status: "future", label: "Camera group: cold bore flag — user taps first shot, excluded from group, tracked separately" },
+    { status: "future", label: "Camera group: cold bore analytics — offset direction/magnitude over time, rounds to settle, barrel life correlation" },
+    { status: "future", label: "Camera wind splash measurement — horizontal POI from photo" },
+    { status: "future", label: "Camera wind/target direction capture — use phone camera to set bearing" },
+    { status: "future", label: "Wind bracket probability system — optimal hold for max P(hit) (math proven, JSX exists)" },
+    { status: "future", label: "Wind HUD — real-time Calypso sim with live DOPE + k-means clustering (JSX exists)" },
+    { status: "future", label: "Wind terrain adaptation — per-range wind profiles learned from data" },
+    { status: "future", label: "Vertical wind component detection (updrafts/downdrafts on hillsides)" },
+    { status: "future", label: "Max ordinate wind effect — elevated position changes drift profile" },
+    { status: "future", label: "Trig bullet drift variation — muzzle wind vs terminal wind different effect" },
+    { status: "future", label: "Short-range interpolation engine — bypass BC under 125yd, use measured data" },
+    { status: "future", label: "Chrono unit-to-unit offset tracking (Athlon vs Caldwell bias)" },
+    { status: "future", label: "L-M Cd knot corrections (needs 5+ sessions)" },
+    { status: "future", label: "Outlier detection — app suggests suspect points, removed points go to quarantine list with flush option" },
+    { status: "future", label: "Stage builder + target sequencer + shot timer + auto-advance" },
+    { status: "future", label: "Stage builder — advertised distance as fallback, easily updated when targets are ranged during COF walk" },
+    { status: "future", label: "Stage builder — target angle capture during COF walk, stored per engagement" },
+    { status: "future", label: "E-Dope NFC output to K&M Precision card" },
+    { status: "future", label: "Stage sequence mode — one target at a time, large text, auto-advance on shot" },
+    { status: "future", label: "Shooter analytics — hit rate, stage scores, progression tracking" },
+    { status: "future", label: "GPS range cards — save DOPE tables by GPS location" },
+    { status: "future", label: "Camera wind reading — mirage/flag analysis (needs native Kotlin + TF Lite)" },
+    { status: "future", label: "CZT profile setup (wife's rifle)" },
+    { status: "future", label: "Bolt production rebuild — sync R&D to production" },
+    // FUTURE — MATCH CALENDAR & TRACKING
+    { status: "future", label: "CAL: Match calendar — schedule, results, sharable with team" },
+    { status: "future", label: "CAL: Round count tracking — deducted from ammo inventory per match/session" },
+    { status: "future", label: "CAL: Ammo/component inventory — bullets, brass, powder, primers for reloaders" },
+    { status: "future", label: "CAL: Cleaning cycle counter — rounds since last clean, alert at threshold" },
+    { status: "future", label: "CAL: Barrel life tracking — total round count per barrel, accuracy degradation notes" },
+    { status: "future", label: "CAL: Cost tracking — ammo cost per match, per session, running totals" },
+    { status: "future", label: "CAL: Weather history per match — archive DA, temp, wind for venue year-over-year" },
+    { status: "future", label: "CAL: Multi-match season tracking — classification progression, running scores" },
+    // FUTURE — TEAM SHARING
+    { status: "future", label: "TEAM: Peer-to-peer sharing — BLE or local WiFi, no internet needed" },
+    { status: "future", label: "TEAM: Wind calls that are working — real-time holds by stage, timestamped" },
+    { status: "future", label: "TEAM: Stage notes — barricade condition, target visibility, timing intel" },
+    { status: "future", label: "TEAM: Ranged distance flag — warn if ranged ≠ advertised, suggest with RF offset" },
+    { status: "future", label: "TEAM: Rangefinder offset pairing — store delta between teammates' units" },
+    { status: "future", label: "TEAM: Target angles shared from COF walk" },
+    { status: "future", label: "TEAM: Spotter calls on shared card — tap splash correction, appears on shooter's display" },
+    { status: "future", label: "TEAM: Hit/miss results by stage — squadmate intel" },
+    { status: "future", label: "TEAM: Wind condition trending — track wind changes across match timeline" },
+    // FUTURE — DATA & BALLISTICS
+    { status: "future", label: "Aerodynamic jump — lateral throw on bullet exit (add to solver)" },
+    { status: "future", label: "Magnus effect — spinning bullet in crosswind gets vertical deflection" },
+    { status: "future", label: "Barrel harmonic tracking — POI shift with barrel temp and round count" },
+    { status: "future", label: "Barrel node mapping — plot group size vs MV, identify node/anti-node velocity bands" },
+    { status: "future", label: "Barrel node alerts — warn when seasonal MV drift approaches anti-node" },
+    { status: "future", label: "Barrel node seasonal prediction — flag when summer MV will push off-node, suggest lot swap" },
+    { status: "future", label: "Tuner optimization — log tuner setting vs MV vs group, learn node shift per setting" },
+    { status: "future", label: "Tuner recommendation — new ammo MV → app suggests optimal tuner setting from learned data" },
+    { status: "future", label: "Tuner + ammo lot pairing — teammate changes lot, app recommends tuner for their MV" },
+    { status: "future", label: "Cold bore offset — first round vs warm bore POI shift tracking" },
+    { status: "future", label: "Lot-to-lot MV tracking — record MV delta when switching ammo lots" },
+    { status: "future", label: "Selective export — pick which rifles/ammo/truing to include, auto-links dependencies" },
+    { status: "future", label: "Selective import — checkbox picker per category, tagged as imported, delete-imported cleanup" },
+    { status: "future", label: "Print DOPE card to PDF" },
+    { status: "future", label: "Score entry + running total during match" },
+    // FUTURE — TRAINING & DRILL
+    { status: "future", label: "TRAIN: Shot call logging — where you thought it broke vs actual, tracks calling accuracy" },
+    { status: "future", label: "TRAIN: Position performance tracking — prone, standing, kneeling, double knee, prop subcategories" },
+    { status: "future", label: "TRAIN: Position + prop detail — track specific setups (ladder top, rope, tank trap, etc)" },
+    { status: "future", label: "TRAIN: Weakness identification — auto-surface highest opportunity areas from position data" },
+    { status: "future", label: "TRAIN: Dry fire timer/par drill mode — practice stage transitions at home" },
+    { status: "future", label: "TRAIN: Training plan generator — prioritize drills based on weakest positions/props" },
+    // FUTURE — MATCH INTELLIGENCE
+    { status: "future", label: "INTEL: Stage difficulty rating — community hit rate data per target per venue" },
+    { status: "future", label: "INTEL: Venue history — your past results, wind patterns, what worked at this range" },
+    { status: "future", label: "INTEL: Stage strategy optimizer — optimal engagement order based on your hit probabilities" },
+    // FUTURE — AMMO MANAGEMENT
+    { status: "future", label: "AMMO: Lot testing protocol — structured test, app guides procedure, auto-captures data" },
+    { status: "future", label: "AMMO: Lot comparison tool — overlay group size + MV distributions side by side" },
+    { status: "future", label: "AMMO: Lot purchase decision — new lot MV vs node map, buy/don't buy recommendation" },
+    // FUTURE — RIFLE MAINTENANCE
+    { status: "future", label: "MAINT: Scope zero drift tracking — log zero checks over time, detect shift" },
+    { status: "future", label: "MAINT: Torque spec log — action screws, ring screws, last torqued date" },
+    { status: "future", label: "MAINT: Parts replacement log — springs, extractors, firing pins with round count" },
+    // FUTURE — ENVIRONMENTAL
+    { status: "future", label: "ENV: Mirage reading guide — interactive reference for boil/flow through scope" },
+    { status: "future", label: "ENV: Light condition tracking — POI shift from lighting angle on steel at distance" },
+    // FUTURE — BLE INTEGRATION
+    { status: "future", label: "BLE: Calypso wind — standard 0x181A, trivial (UUIDs documented)" },
+    { status: "future", label: "BLE: Kestrel 5700 weather — 67 UUIDs extracted from Strelok, needs nRF mapping" },
+    { status: "future", label: "BLE: Sig Kilo 3K rangefinder — protocol mapped from BDX APK, needs nRF capture" },
+    { status: "future", label: "BLE: Hub architecture — phone connects Card + Kilo + Calypso simultaneously" },
+    { status: "future", label: "Strelok SDK upload — extract decoded Kestrel characteristic mappings" },
+    // FUTURE — HARDWARE (DOPE DISPLAY)
+    { status: "future", label: "HW: DOPE display V1 — ESP32-C3 + 2.9\" e-paper + BME280 weather (~$35 BOM)" },
+    { status: "future", label: "HW: LSM6DSO IMU — cant ±0.2°, stability, muzzle trace (replaces SG Pulse)" },
+    { status: "future", label: "HW: MAX4466 acoustic shot detection — MEMS mic, adjustable sensitivity" },
+    { status: "future", label: "HW: WS2812B ocular LED — green=level, red=right cant, blue=left cant" },
+    { status: "future", label: "HW: LIS3MDL compass mount — Picatinny, pogo pin I2C bridge, per-rifle" },
+    { status: "future", label: "HW: V2 ultrasonic anemometer — 4× 40kHz transducers, replaces Calypso" },
+    // FUTURE — BUSINESS
+    { status: "future", label: "BIZ: YouTube 10-episode series (outlined, content-first strategy)" },
+    { status: "future", label: "BIZ: TM22 data licensing to AB/Kestrel/Revic/SIG" },
+    { status: "future", label: "BIZ: App subscription model ($9.99/mo Pro tier)" },
+    { status: "future", label: "BIZ: Hardware sales — DOPE display $150-200 retail, 75-85% margin" },
+    { status: "future", label: "BIZ: Defense/military fire control kit ($300 BOM → $3-5K system)" },
+    { status: "future", label: "BIZ: Provisional patent — wind bracket probability method ($320)" },
+  ];
+
+  return (
+    <div>
+      {/* Your Notes */}
+      <div style={sCard}>
+        <div style={{color:C.accent,fontSize:14,fontWeight:700,marginBottom:8}}>YOUR NOTES</div>
+        {devNotes.filter(n=>n.status==="open").length === 0 ? (
+          <div style={{color:C.dim,fontSize:12,textAlign:"center",padding:10}}>No open notes. Add bugs, features, or observations below.</div>
+        ) : (
+          devNotes.filter(n=>n.status==="open").map(n => {
+            const ti = tagInfo(n.tag);
+            const dt = new Date(n.timestamp);
+            const dateStr = `${dt.getMonth()+1}/${dt.getDate()} ${dt.getHours()}:${String(dt.getMinutes()).padStart(2,"0")}`;
+            return (
+              <div key={n.id} style={{display:"flex",gap:6,alignItems:"flex-start",marginBottom:6,paddingLeft:4}}>
+                <span style={{cursor:"pointer",fontSize:12,color:C.dim,marginTop:1}} onClick={()=>toggleStatus(n.id)}>○</span>
+                <div style={{flex:1}}>
+                  <span style={{fontSize:10,color:ti.color,fontWeight:700}}>{ti.label}</span>
+                  <span style={{fontSize:9,color:C.dim,marginLeft:6}}>{dateStr}</span>
+                  <div style={{color:C.text,fontSize:11,lineHeight:1.4}}>{n.text}</div>
+                </div>
+                <span style={{cursor:"pointer",fontSize:11,color:C.red}} onClick={()=>deleteNote(n.id)}>✕</span>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      {/* Roadmap */}
+      <div style={sCard}>
+        <div style={{color:C.accent,fontSize:14,fontWeight:700,marginBottom:8}}>DEVELOPMENT ROADMAP</div>
+        {["next", "done", "future"].map(phase => (
+          <div key={phase} style={{marginBottom:10}}>
+            <div style={{color: phase==="done"?C.green:phase==="next"?C.yellow:C.dim, fontSize:11, fontWeight:700, marginBottom:4}}>
+              {phase==="next"?"▶ NEXT UP — BUILDING NOW":phase==="done"?`✓ COMPLETED (${roadmap.filter(r=>r.status==="done").length})`:"◻ FUTURE — NOT YET SCHEDULED"}
+            </div>
+            {phase==="future" ? (
+              <>
+                {[
+                  {prefix:"future", filter:r=>!r.label.startsWith("BLE:")&&!r.label.startsWith("HW:")&&!r.label.startsWith("BIZ:")&&!r.label.startsWith("CAL:")&&!r.label.startsWith("TEAM:")&&!r.label.startsWith("TRAIN:")&&!r.label.startsWith("INTEL:")&&!r.label.startsWith("AMMO:")&&!r.label.startsWith("MAINT:")&&!r.label.startsWith("ENV:"), title:"SOFTWARE"},
+                  {prefix:"train", filter:r=>r.label.startsWith("TRAIN:"), title:"TRAINING & DRILLS"},
+                  {prefix:"intel", filter:r=>r.label.startsWith("INTEL:"), title:"MATCH INTELLIGENCE"},
+                  {prefix:"ammo", filter:r=>r.label.startsWith("AMMO:"), title:"AMMO MANAGEMENT"},
+                  {prefix:"cal", filter:r=>r.label.startsWith("CAL:"), title:"MATCH CALENDAR & TRACKING"},
+                  {prefix:"team", filter:r=>r.label.startsWith("TEAM:"), title:"TEAM SHARING"},
+                  {prefix:"maint", filter:r=>r.label.startsWith("MAINT:"), title:"RIFLE MAINTENANCE"},
+                  {prefix:"env", filter:r=>r.label.startsWith("ENV:"), title:"ENVIRONMENTAL"},
+                  {prefix:"ble", filter:r=>r.label.startsWith("BLE:"), title:"BLE INTEGRATION"},
+                  {prefix:"hw", filter:r=>r.label.startsWith("HW:"), title:"HARDWARE — DOPE DISPLAY"},
+                  {prefix:"biz", filter:r=>r.label.startsWith("BIZ:"), title:"BUSINESS"},
+                ].map(cat => {
+                  const items = roadmap.filter(r=>r.status==="future").filter(cat.filter);
+                  if(!items.length) return null;
+                  return (
+                    <div key={cat.prefix} style={{marginBottom:8}}>
+                      <div style={{color:C.dim,fontSize:9,fontWeight:700,marginBottom:2,marginTop:6,paddingLeft:4}}>{cat.title}</div>
+                      {items.map((r,i) => (
+                        <div key={i} style={{color:C.text,fontSize:11,lineHeight:1.6,paddingLeft:8}}>
+                          ○ {r.label.replace(/^(BLE|HW|BIZ): /,"")}
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })}
+              </>
+            ) : (
+              roadmap.filter(r=>r.status===phase).map((r,i) => (
+                <div key={i} style={{color: phase==="done"?C.dim:C.text, fontSize:11, lineHeight:1.6, paddingLeft:8}}>
+                  {phase==="done"?"✓":phase==="next"?"▸":"○"} {r.label}
+                </div>
+              ))
+            )}
+          </div>
+        ))}
+      </div>
+
+      {/* Session stats */}
+      <div style={sCard}>
+        <div style={{color:C.accent,fontSize:14,fontWeight:700,marginBottom:8}}>CURRENT BUILD STATS</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4,fontSize:12,color:C.dim}}>
+          <span>Build:</span><span style={{color:C.text}}>MatchOS V3 — TM22 Engine + Wind Log + Spin Drift</span>
+          <span>Date:</span><span style={{color:C.text}}>Feb 18, 2026</span>
+          <span>Sessions:</span><span style={{color:C.text}}>9 Claude chats (S34–S35)</span>
+          <span>Engine:</span><span style={{color:C.text}}>TM22 single BC 0.0535</span>
+          <span>Accuracy:</span><span style={{color:C.text}}>avg ±0.11 max ±0.30 MIL</span>
+          <span>Data:</span><span style={{color:C.text}}>28 pts, 4 field sessions</span>
+          <span>DA range:</span><span style={{color:C.text}}>-328 to 1007 ft (1335ft)</span>
+        </div>
+      </div>
+
+      {/* Add note */}
+      <div style={sCard}>
+        <div style={{color:C.accent,fontSize:14,fontWeight:700,marginBottom:8}}>ADD NOTE</div>
+        <div style={{display:"flex",gap:4,marginBottom:8,flexWrap:"wrap"}}>
+          {tags.map(t => (
+            <button key={t.id} onClick={()=>setNoteTag(t.id)} style={{
+              ...sBtnSm, padding:"4px 10px", fontSize:11,
+              background: noteTag===t.id ? t.color : C.card,
+              border: noteTag===t.id ? "none" : `1px solid ${C.border}`,
+              opacity: noteTag===t.id ? 1 : 0.6
+            }}>{t.label}</button>
+          ))}
+        </div>
+        <textarea style={{...sInput, minHeight:60, resize:"vertical", fontFamily:"system-ui"}} value={noteText} onChange={e=>setNoteText(e.target.value)} placeholder="Describe the bug, feature idea, or observation..." />
+        <button style={{...sBtn,marginTop:6}} onClick={addNote}>+ Add Note</button>
+      </div>
+
+      {/* Completed notes */}
+      {devNotes.filter(n=>n.status==="done").length > 0 && (
+        <div style={sCard}>
+          <div style={{color:C.dim,fontSize:11,fontWeight:600,marginBottom:6}}>RESOLVED ({devNotes.filter(n=>n.status==="done").length})</div>
+          {devNotes.filter(n=>n.status==="done").map(n => {
+            const ti = tagInfo(n.tag);
+            return (
+              <div key={n.id} style={{display:"flex",gap:6,alignItems:"flex-start",marginBottom:4,paddingLeft:4,opacity:0.5}}>
+                <span style={{cursor:"pointer",fontSize:12,color:C.green,marginTop:1}} onClick={()=>toggleStatus(n.id)}>✓</span>
+                <div style={{flex:1}}>
+                  <span style={{fontSize:10,color:ti.color,fontWeight:700}}>{ti.label}</span>
+                  <span style={{color:C.dim,fontSize:11,marginLeft:6,textDecoration:"line-through"}}>{n.text}</span>
+                </div>
+                <span style={{cursor:"pointer",fontSize:11,color:C.red}} onClick={()=>deleteNote(n.id)}>✕</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================================
+// ============================================================================
+// APP — with persistence + BLE
+// ============================================================================
+const STORAGE_KEY = "tm22_data_v3";
+
+function App() {
+  const [loaded, setLoaded] = useState(false);
+  const [tab, setTab] = useState("hud");
+  const [rifles, setRifles] = useState([]);
+  const [ammo, setAmmo] = useState([]);
+  const [truingData, setTruingData] = useState({});
+  const [windLog, setWindLog] = useState([]);
+  const [devNotes, setDevNotes] = useState([]);
+  const [bleWeather, setBleWeather] = useState(null);
+  const [hudState, setHudState] = useState({
+    rifleId:"",ammoId:"",range:100,temp:"59",da:"0",mvOverride:"",
+    showEnv:false,showTable:false,
+    tableMin:25,tableMax:325,tableStep:25,
+    wind1Speed:"",wind2Speed:"",targetBearing:"",windFrom:"",dirMode:"clock"
+  });
+
+  // Load from localStorage on mount
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const d = JSON.parse(raw);
+        if (d.rifles) setRifles(d.rifles);
+        if (d.ammo) setAmmo(d.ammo);
+        if (d.truingData) setTruingData(d.truingData);
+        if (d.windLog) setWindLog(d.windLog);
+        if (d.devNotes) setDevNotes(d.devNotes);
+        if (d.tab) setTab(d.tab);
+        if (d.hudState) setHudState(prev => ({...prev, ...d.hudState}));
+      }
+    } catch (e) { console.warn("Load failed:", e); }
+    setLoaded(true);
+  }, []);
+
+  // Save to localStorage on every change
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ rifles, ammo, truingData, windLog, devNotes, tab, hudState }));
+    } catch (e) { console.warn("Save failed:", e); }
+  }, [rifles, ammo, truingData, windLog, devNotes, tab, hudState, loaded]);
+
+  // Handle BLE weather updates (from Calypso/Kestrel/BME280)
+  const onBleWeather = useCallback((w) => {
+    setBleWeather(w);
+  }, []);
+
+  if (!loaded) return (
+    <div style={{ background: C.bg, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", color: C.dim, fontFamily: "system-ui" }}>
+      Loading...
+    </div>
+  );
+
+  const tabs = [
+    {id:"hud",label:"HUD",icon:"◎"},
+    {id:"truing",label:"Truing",icon:"◉"},
+    {id:"profiles",label:"Profiles",icon:"☰"},
+    {id:"ble",label:"BLE",icon:"📡"},
+    {id:"guide",label:"Guide",icon:"📋"},
+    {id:"dev",label:"Dev",icon:"🔧"},
+  ];
+
+  return (
+    <div style={{background:C.bg,minHeight:"100vh",maxWidth:480,margin:"0 auto",fontFamily:"system-ui, -apple-system, sans-serif",display:"flex",flexDirection:"column"}}>
+      <div style={{background:C.card,borderBottom:`1px solid ${C.border}`,padding:"8px 12px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <span style={{color:C.accent,fontSize:16,fontWeight:700,letterSpacing:1}}>MatchOS</span>
+        <span style={{color:C.dim,fontSize:9}}>TM22 Engine · v3</span>
+      </div>
+      <div style={{flex:1,padding:12,paddingBottom:70,overflowY:"auto"}}>
+        {tab==="hud"&&<HudTab rifles={rifles} ammo={ammo} truingData={truingData} bleWeather={bleWeather} hudState={hudState} setHudState={setHudState} windLog={windLog} setWindLog={setWindLog} />}
+        {tab==="truing"&&<TruingTab rifles={rifles} ammo={ammo} setRifles={setRifles} truingData={truingData} setTruingData={setTruingData} />}
+        {tab==="profiles"&&<ProfilesTab rifles={rifles} setRifles={setRifles} ammo={ammo} setAmmo={setAmmo} />}
+        {tab==="ble"&&<BlePanel onWeatherUpdate={onBleWeather} />}
+        {tab==="guide"&&<GuideTab />}
+        {tab==="dev"&&<DevTab devNotes={devNotes} setDevNotes={setDevNotes} />}
+      </div>
+      <div style={{position:"fixed",bottom:0,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:480,background:C.card,borderTop:`1px solid ${C.border}`,display:"flex",zIndex:100}}>
+        {tabs.map(t=>(
+          <button key={t.id} onClick={()=>setTab(t.id)} style={{flex:1,padding:"10px 0",background:"transparent",border:"none",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:2,color:tab===t.id?C.accent:C.dim,borderTop:tab===t.id?`2px solid ${C.accent}`:"2px solid transparent"}}>
+            <span style={{fontSize:16}}>{t.icon}</span>
+            <span style={{fontSize:9,fontWeight:600}}>{t.label}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Mount
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(React.createElement(App));
+  </script>
+</body>
+</html>
