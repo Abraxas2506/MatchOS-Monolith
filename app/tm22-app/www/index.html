@@ -1578,7 +1578,9 @@ function HudTab({ rifles, ammo, truingData, bleWeather, hudState, setHudState, w
           <div style={{flex:1}}><label style={sLabel}>Wind Min (mph)</label><input style={sInput} inputMode="decimal" value={hs.wind1Speed} onChange={e=>set("wind1Speed",e.target.value)} placeholder="0" /></div>
           <div style={{flex:1}}><label style={sLabel}>Wind Max (mph)</label><input style={sInput} inputMode="decimal" value={hs.wind2Speed} onChange={e=>set("wind2Speed",e.target.value)} placeholder="0" /></div>
         </div>
-        {(w1>0||w2>0)&&<div style={{color:C.dim,fontSize:10,marginTop:6}}>{Math.abs(cFrac)<0.17?"Head/Tail":Math.abs(cFrac)>0.94?"Full Cross":`${(Math.abs(cFrac)*100).toFixed(0)}% cross`} {cFrac>=0?"R":"L"}</div>}
+        {(w1>0||w2>0) && ((!hs.targetBearing||!hs.windFrom)
+          ? <div style={{color:C.yellow,fontSize:10,marginTop:6,fontWeight:600}}>⚠ Set Target and Wind FROM direction — hold = 0 without both</div>
+          : <div style={{color:C.dim,fontSize:10,marginTop:6}}>{Math.abs(cFrac)<0.17?"Head/Tail":Math.abs(cFrac)>0.94?"Full Cross":`${(Math.abs(cFrac)*100).toFixed(0)}% cross`} {cFrac>=0?"R":"L"}</div>)}
       </div>
 
       {/* Environment */}
@@ -2390,7 +2392,7 @@ function App() {
     rifleId:"",ammoId:"",range:100,temp:"59",da:"0",mvOverride:"",
     showEnv:false,showTable:false,
     tableMin:25,tableMax:325,tableStep:25,
-    wind1Speed:"",wind2Speed:"",targetBearing:"",windFrom:"",dirMode:"clock"
+    wind1Speed:"",wind2Speed:"",targetBearing:"12:00",windFrom:"3:00",dirMode:"clock"
   });
 
   // Load from localStorage on mount
@@ -2405,7 +2407,14 @@ function App() {
         if (d.windLog) setWindLog(d.windLog);
         if (d.devNotes) setDevNotes(d.devNotes);
         if (d.tab) setTab(d.tab);
-        if (d.hudState) setHudState(prev => ({...prev, ...d.hudState}));
+        if (d.hudState) {
+          // Migrate blank bearings to full-value-crosswind defaults
+          // (legacy state stored "" which made cFrac=sin(0)=0 → wind hold stuck at 0)
+          const hs = {...d.hudState};
+          if (!hs.targetBearing) hs.targetBearing = "12:00";
+          if (!hs.windFrom) hs.windFrom = "3:00";
+          setHudState(prev => ({...prev, ...hs}));
+        }
       }
     } catch (e) { console.warn("Load failed:", e); }
     setLoaded(true);
